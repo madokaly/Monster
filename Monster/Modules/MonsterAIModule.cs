@@ -166,10 +166,19 @@ namespace Game.Entities
         private void TickDecision(float deltaTime)
         {
             // 施法中：决策与移动意图的所有权都让给技能链步骤
-            // （步骤自行写 IsStopped 停 Follower 后手动位移，见 MonsterChaseStep / MonsterBurrowStep）
+            // （步骤停驻让位或直接下发寻路指令驱动，见 MonsterChaseStep / MonsterBurrowStep）
             if (_model.ActState == MonsterActState.Casting)
             {
                 _wasCasting = true;
+                return;
+            }
+
+            // 冻结门控（§16.5：owner == 本端玩家实体才驱动决策与移动指令）：
+            // owner 无效（冻结）或 owner 指向其他端（权威交接瞬态）→ 停发移动指令，
+            // Follower 停止由 MonsterMoveModule 监听同一事实执行
+            if (!IsOwnerLocalPlayer())
+            {
+                SetStopIntent();
                 return;
             }
 
@@ -210,6 +219,18 @@ namespace Game.Entities
 
             // 唯一下达点：每 tick 无条件重申当前意图（Model 的 no-op 早退负责去重）
             _model.SetMoveCommand(_moveIntent);
+        }
+
+        /// <summary>
+        /// owner 事实是否指向本端玩家实体（MainPlayer 或本端玩家驾驶的 Mech）；
+        /// 逐 tick 读 [Networked] 事实（等价订阅 Changed + Resync 的即时性）。
+        /// </summary>
+        private bool IsOwnerLocalPlayer()
+        {
+            var owner = _model.DesiredAuthorityOwner;
+            if (!owner.IsValid) return false;
+            if (owner == Svcer.Req<EntityId>(SvcID.QueryLocalPlayer)) return true;
+            return owner == Svcer.Req<EntityId>(SvcID.QueryLocalMech);
         }
 
         /// <summary>
@@ -341,8 +362,8 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 选择并施放第一条冷却就绪且目标在射程内的技能链。
-        /// 技能池 = Ctrl 序列化的链列表（§16.2），权重 0 不进池（权重排序筛选后续实现）。
+        /// 从冷却就绪且目标在射程内的技能链中按 Weight 加权抽选并施放。
+        /// 技能池 = Ctrl 序列化的链列表（§18.2），权重 0 不进池。
         /// </summary>
         private bool TryCastReadySkill(MonsterPerceptionSnapshot snapshot)
         {
@@ -351,6 +372,8 @@ namespace Game.Entities
             if (!TryGetTargetPosition(snapshot.BestTargetId, out var targetPos)) return false;
 
             Vector3 selfPos = SelfPosition;
+            int selectedChainIndex = -1;
+            long totalWeight = 0;
 
             for (int i = 0; i < _model.ChainCount; i++)
             {
@@ -368,13 +391,16 @@ namespace Game.Entities
                 float attackDistance = chain.AttackDistance;
                 if (HorizontalDistance(selfPos, targetPos) > Mathf.Max(0.1f, attackDistance)) continue;
 
-                if (_model.TryCastChain(i, snapshot.BestTargetId))
+                // 单遍加权抽样：当前候选以 Weight / 累计权重的概率替换已选候选。
+                totalWeight += chain.Weight;
+                if (selectedChainIndex < 0 || Random.value * totalWeight < chain.Weight)
                 {
-                    return true;
+                    selectedChainIndex = i;
                 }
             }
 
-            return false;
+            return selectedChainIndex >= 0
+                && _model.TryCastChain(selectedChainIndex, snapshot.BestTargetId);
         }
 
         #endregion

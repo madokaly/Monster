@@ -62,6 +62,7 @@ namespace Game.Entities
 
             EnsureFollowerEntityOrientation();
             SnapToNavMesh();
+            RefreshFrozenState();
         }
 
         protected override void OnFixedUpdateNetwork(float deltaTime)
@@ -83,8 +84,10 @@ namespace Game.Entities
 
             _model.OnTeleportPositionPushed += OnTeleportPositionPushedHandler;
             _model.OnTeleportRotationPushed += OnTeleportRotationPushedHandler;
+            _model.OnBodyRotationPushed += OnBodyRotationPushedHandler;
 
             _model.OnMoveCommandChanged += OnMoveCommandChangedHandler;
+            _model.OnDesiredAuthorityOwnerChanged += OnDesiredAuthorityOwnerChangedHandler;
         }
 
         private void ClearModelListeners()
@@ -93,8 +96,10 @@ namespace Game.Entities
 
             _model.OnTeleportPositionPushed -= OnTeleportPositionPushedHandler;
             _model.OnTeleportRotationPushed -= OnTeleportRotationPushedHandler;
+            _model.OnBodyRotationPushed -= OnBodyRotationPushedHandler;
 
             _model.OnMoveCommandChanged -= OnMoveCommandChangedHandler;
+            _model.OnDesiredAuthorityOwnerChanged -= OnDesiredAuthorityOwnerChangedHandler;
         }
 
         private void RegisterComponentListeners()
@@ -148,6 +153,61 @@ namespace Game.Entities
 
             var follower = _config.Follower;
             if (follower != null) follower.rotation = rotation;
+        }
+
+        /// <summary>
+        /// 本体旋转推送（权威端逐 tick，如 Beam 吐息转向跟踪）。
+        /// 施放期移动虽停（IsStopped），ECS 代理仍持续朝既有 targetRotation
+        /// （停止前的旧朝向，无路径分支）以 maxRotationSpeed 回拽——写实体内部旋转同样会被拽回；
+        /// 必须关闭 updateRotation 斩断 ECS → transform 的旋转回写，transform 直写才生效，
+        /// 移动指令恢复时由 EnsureRotationOwnedByFollower 归还所有权。
+        /// </summary>
+        private void OnBodyRotationPushedHandler(Quaternion rotation)
+        {
+            if (_config is null) return;
+            if (!HasStateAuthority) return;
+
+            if (_config.Body == null)
+            {
+                Logging.Error($"[MonsterMoveModule] OnBodyRotationPushedHandler: _config.Body 为 null");
+                return;
+            }
+
+            var follower = _config.Follower;
+            if (follower != null && follower.updateRotation)
+            {
+                follower.updateRotation = false;
+            }
+
+            _config.Body.rotation = rotation;
+
+            // 内部旋转同步对齐（updateRotation 已关仅内部生效），恢复所有权时零跳变
+            if (follower != null) follower.rotation = rotation;
+        }
+
+        /// <summary>
+        /// 归还 FollowerEntity 的旋转所有权（移动指令恢复时调用）：
+        /// 重新开启 updateRotation，并把代理内部旋转对齐当前 transform，避免回开瞬间回甩。
+        /// </summary>
+        private void EnsureRotationOwnedByFollower(FollowerEntity follower)
+        {
+            if (follower == null) return;
+            if (follower.updateRotation) return;
+
+            follower.updateRotation = true;
+            if (_config.Body != null) follower.rotation = _config.Body.rotation;
+        }
+
+        /// <summary>
+        /// 归属事实变化（全端）：仅权威端反应——冻结（owner 无效）关停移动模拟，
+        /// 解冻恢复模拟开关（移动指令由 AI 决策随后的 tick 重新下达）。
+        /// </summary>
+        private void OnDesiredAuthorityOwnerChangedHandler(EntityId ownerId)
+        {
+            if (_config is null) return;
+            if (!HasStateAuthority) return;
+
+            RefreshFrozenState();
         }
 
         private void OnMoveCommandChangedHandler(MonsterMoveCommand command)
@@ -230,11 +290,13 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 准备移动代理（速度 / 停距 / 移动模拟开关）
+        /// 准备移动代理（速度 / 停距 / 移动模拟开关；移动恢复即归还旋转所有权）
         /// </summary>
         private void PrepareMovementInternal(float moveSpeed, float stopDistance)
         {
             var follower = _config.Follower;
+
+            EnsureRotationOwnedByFollower(follower);
 
             follower.maxSpeed = Mathf.Max(0.1f, moveSpeed);
             follower.stopDistance = Mathf.Max(0.1f, stopDistance);
@@ -253,6 +315,42 @@ namespace Game.Entities
 
             follower.destination = follower.transform.position;
             follower.isStopped = true;
+        }
+
+        /// <summary>
+        /// 模拟门控 = owner 事实指向本端玩家实体（§16.5）：冻结（owner 无效）或 owner 指向其他端
+        /// （权威交接瞬态）→ 停 Follower + 关移动模拟（权威端场景已卸载时无寻路图，避免无图模拟）；
+        /// 解冻只恢复模拟开关，具体移动由 AI 决策下一 tick 的移动指令驱动。
+        /// </summary>
+        private void RefreshFrozenState()
+        {
+            var follower = _config.Follower;
+            if (follower == null)
+            {
+                Logging.Error("[MonsterMoveModule] RefreshFrozenState: Follower 为 null，请检查 Inspector 引用。");
+                return;
+            }
+
+            bool simulate = IsOwnerLocalPlayer();
+
+            if (!simulate)
+            {
+                StopMovementInternal();
+                follower.simulateMovement = false;
+            }
+            else
+            {
+                follower.simulateMovement = true;
+            }
+        }
+
+        /// <summary> owner 事实是否指向本端玩家实体（MainPlayer 或本端玩家驾驶的 Mech） </summary>
+        private bool IsOwnerLocalPlayer()
+        {
+            var owner = _model.DesiredAuthorityOwner;
+            if (!owner.IsValid) return false;
+            if (owner == Svcer.Req<EntityId>(SvcID.QueryLocalPlayer)) return true;
+            return owner == Svcer.Req<EntityId>(SvcID.QueryLocalMech);
         }
 
         /// <summary>

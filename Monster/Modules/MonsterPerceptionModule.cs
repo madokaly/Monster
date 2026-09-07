@@ -54,6 +54,9 @@ namespace Game.Entities
     /// </summary>
     public class MonsterPerceptionModule : ModuleBase
     {
+        private const int GIZMO_CIRCLE_SEGMENTS = 64;
+        private const float GIZMO_HEIGHT_OFFSET = 0.05f;
+
         private readonly MonsterModel _model;
         private readonly MonsterPerceptionModuleConfig _config;
 
@@ -151,9 +154,9 @@ namespace Game.Entities
             Vector3 currentPos = _config.SelfTransform.position;
             Vector3 spawnPos = _model.PatrolCenter;
 
-            float searchRange = ResolveSearchRange();
-            float chaseRange = ResolveChaseRange();
-            float disengageRadius = Mathf.Max(chaseRange, ResolveDisengageRadius());
+            float searchRange = ResolveSearchRange(_model, _config);
+            float chaseRange = ResolveChaseRange(_model, _config);
+            float disengageRadius = Mathf.Max(chaseRange, ResolveDisengageRadius(_model, _config));
 
             // AOI 查询：以怪物当前位置为中心，半径需同时覆盖
             //   - 当前位置 + chaseRange（追击圈）
@@ -175,25 +178,27 @@ namespace Game.Entities
             _model.SetPerceptionSnapshot(BuildSnapshot());
         }
 
-        private float ResolveSearchRange()
+        private static float ResolveSearchRange(MonsterModel model, MonsterPerceptionModuleConfig config)
         {
-            if (_config.SearchRange > 0f) return _config.SearchRange;
+            if (config is not null && config.SearchRange > 0f) return config.SearchRange;
 
-            var cfg = _model.Cfg;
+            var cfg = model?.Cfg;
             return cfg != null && cfg.DetectionRange > 0 ? cfg.DetectionRange : 0f;
         }
 
-        private float ResolveChaseRange()
+        private static float ResolveChaseRange(MonsterModel model, MonsterPerceptionModuleConfig config)
         {
-            if (_config.ChaseRange > 0f) return _config.ChaseRange;
+            if (config is not null && config.ChaseRange > 0f) return config.ChaseRange;
 
-            var cfg = _model.Cfg;
+            var cfg = model?.Cfg;
             return cfg != null && cfg.AlertRange > 0 ? cfg.AlertRange : 0f;
         }
 
-        private float ResolveDisengageRadius()
+        private static float ResolveDisengageRadius(MonsterModel model, MonsterPerceptionModuleConfig config)
         {
-            return _model.DisengageRadius > 0f ? _model.DisengageRadius : ResolveChaseRange();
+            return model is not null && model.DisengageRadius > 0f
+                ? model.DisengageRadius
+                : ResolveChaseRange(model, config);
         }
 
         /// <summary>
@@ -369,6 +374,79 @@ namespace Game.Entities
             b.y = 0f;
             return Vector3.Distance(a, b);
         }
+
+#if UNITY_EDITOR
+        /// <summary>
+        /// 绘制三层感知范围。编辑态使用 Inspector 范围并以怪物为圆心；
+        /// Play Mode 在实体生成后使用与感知判定相同的有效范围及脱战中心。
+        /// </summary>
+        internal static void DrawGizmos(
+            MonsterModel model,
+            MonsterPerceptionModuleConfig config,
+            Transform fallbackTransform)
+        {
+            if (config is null) return;
+
+            Transform selfTransform = config.SelfTransform != null
+                ? config.SelfTransform
+                : fallbackTransform;
+            if (selfTransform == null) return;
+
+            bool hasRuntimeData = Application.isPlaying
+                && model != null
+                && model.Object != null
+                && model.Object.IsValid;
+
+            float searchRange = hasRuntimeData
+                ? ResolveSearchRange(model, config)
+                : Mathf.Max(0f, config.SearchRange);
+            float chaseRange = hasRuntimeData
+                ? ResolveChaseRange(model, config)
+                : Mathf.Max(0f, config.ChaseRange);
+
+            Vector3 currentCenter = selfTransform.position;
+            Vector3 disengageCenter = hasRuntimeData ? model.PatrolCenter : currentCenter;
+            float disengageRadius = hasRuntimeData
+                ? Mathf.Max(chaseRange, ResolveDisengageRadius(model, config))
+                : chaseRange;
+
+            // 轻微错开高度，避免相同半径的线圈完全互相覆盖。
+            DrawHorizontalCircle(
+                currentCenter,
+                searchRange,
+                new Color(1f, 0.2f, 0.2f, 0.9f)
+            );
+            DrawHorizontalCircle(
+                currentCenter + Vector3.up * GIZMO_HEIGHT_OFFSET,
+                chaseRange,
+                new Color(1f, 0.8f, 0f, 0.9f)
+            );
+            DrawHorizontalCircle(
+                disengageCenter + Vector3.up * (GIZMO_HEIGHT_OFFSET * 2f),
+                disengageRadius,
+                new Color(0.2f, 0.5f, 1f, 0.9f)
+            );
+        }
+
+        private static void DrawHorizontalCircle(Vector3 center, float radius, Color color)
+        {
+            if (radius <= 0f) return;
+
+            Color previousColor = Gizmos.color;
+            Gizmos.color = color;
+
+            Vector3 previousPoint = center + Vector3.forward * radius;
+            for (int i = 1; i <= GIZMO_CIRCLE_SEGMENTS; i++)
+            {
+                float angle = i * Mathf.PI * 2f / GIZMO_CIRCLE_SEGMENTS;
+                Vector3 point = center + new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle)) * radius;
+                Gizmos.DrawLine(previousPoint, point);
+                previousPoint = point;
+            }
+
+            Gizmos.color = previousColor;
+        }
+#endif
 
         #endregion
 
