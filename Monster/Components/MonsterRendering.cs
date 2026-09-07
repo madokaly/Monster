@@ -47,7 +47,7 @@ namespace Game.Components
 
         private void Awake()
         {
-            if (_animator == null) _animator = GetComponent<Animator>();
+            if (_animator == null) _animator = GetComponentInChildren<Animator>();
         }
 
         /// <summary>

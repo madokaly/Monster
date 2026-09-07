@@ -130,7 +130,9 @@ namespace Game.Components
 
                     var hitData = new HitData()
                     {
-                        HitPoint = hit.point, HitDirection = Direction, Force = 0f,
+                        HitPoint = hit.point,
+                        HitDirection = Direction,
+                        Force = 0f,
                     };
 
                     Msger.Send(MsgID.ApplyDamage, tag.Id, damageData);
