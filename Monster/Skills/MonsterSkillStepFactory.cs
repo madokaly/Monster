@@ -28,8 +28,6 @@ namespace Game.Entities
                     return new MonsterInstantShotStep(model, instantShotConfig);
                 case MonsterEffectStepConfig effectConfig:
                     return new MonsterEffectStep(model, effectConfig);
-                case MonsterRingWaveStepConfig ringWaveConfig:
-                    return new MonsterRingWaveStep(model, ringWaveConfig);
                 case MonsterBeamStepConfig beamConfig:
                     return new MonsterBeamStep(model, beamConfig);
                 case MonsterBombingStepConfig bombingConfig:
@@ -38,6 +36,10 @@ namespace Game.Entities
                     return new MonsterProjectileStep(model, projectileConfig);
                 case MonsterBurrowStepConfig burrowConfig:
                     return new MonsterBurrowStep(model, burrowConfig);
+                case MonsterRockfallStepConfig rockfallConfig:
+                    return new MonsterRockfallStep(model, rockfallConfig);
+                case MonsterSummonStepConfig summonConfig:
+                    return new MonsterSummonStep(model, summonConfig);
                 default:
                     Logging.Warning(
                         $"[MonsterSkillStepFactory] Create: 未知步骤行为，跳过装配 ({config.GetType().Name})"

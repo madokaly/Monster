@@ -45,9 +45,10 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 追击步骤：窗口内限角旋转 + 限距位移逼近目标（单目标，§16.4）。
+    /// 追击步骤：窗口内限角旋转 + 限距位移逼近目标（单目标）。
     /// Enter（权威端）记录起点 / 算落点（触发距离外才位移）/ 停 Follower 让位；
-    /// Tick（权威端）按窗口进度 lerp 旋转与位移，可选每 tick 撞伤；
+    /// Tick（权威端）按窗口进度 lerp 旋转与位移；
+    /// 撞伤（可选）各端本端时钟结算（受击方本地结算 §1.7，判定原点 = 本端怪物位置）；
     /// 施放结束由 AI 恢复寻路（同旧制）。
     /// </summary>
     public class MonsterChaseStep : MonsterSkillStep
@@ -69,6 +70,9 @@ namespace Game.Entities
         protected override void OnStepEnter(float elapsed)
         {
             if (_chaseConfig is null) return;
+
+            _contactHitTargets.Clear();
+
             if (!HasStateAuthority) return;
 
             BeginChase();
@@ -77,19 +81,22 @@ namespace Game.Entities
         protected override void OnStepTick(float elapsed)
         {
             if (_chaseConfig is null) return;
-            if (!HasStateAuthority) return;
-            if (_chaseConfig.ChaseWindow <= 0f) return;
 
-            float t = Mathf.Clamp01((elapsed - _config.StartOffset) / _chaseConfig.ChaseWindow);
-            StepChase(t);
+            // 移动与旋转（权威端；位姿经 NetworkTransform 同步给各端；内容结束即停驱）
+            if (HasStateAuthority && !IsContentEnded && _chaseConfig.ChaseWindow > 0f)
+            {
+                float t = MonsterChaseTiming.GetProgress(_chaseConfig, elapsed - _config.StartOffset);
+                StepChase(t);
+            }
+
+            // 撞伤（各端受击方本地结算，本端时钟 + 本端怪物位置，§1.7；内容结束即停伤）
+            if (!IsContentEnded && _chaseConfig.ContactDamage > 0)
+            {
+                SettleContactDamage();
+            }
         }
 
         protected override void OnStepExit()
-        {
-            _contactHitTargets.Clear();
-        }
-
-        protected override void OnStepAuthorityChanged()
         {
             _contactHitTargets.Clear();
         }
@@ -108,48 +115,22 @@ namespace Game.Entities
             _chaseStartRot = body.rotation;
             _chaseDestination = _chaseStartPos;
             _chaseWillMove = false;
-            _contactHitTargets.Clear();
 
             if (!TryGetTargetPosition(_model.CastTargetId, out var targetPos)) return;
 
-            Vector3 toTargetInit = targetPos - _chaseStartPos;
-            toTargetInit.y = 0f;
-            float startDist = toTargetInit.magnitude;
-            if (startDist < 0.001f) return;
-
-            _chaseWillMove = startDist > _chaseConfig.ChaseStartDistance;
-            if (_chaseWillMove)
-            {
-                Vector3 dir = toTargetInit / startDist;
-                float maxDistance = _chaseConfig.ChaseDistance;
-                float chaseStartDistance = _chaseConfig.ChaseStartDistance;
-
-                if (startDist <= chaseStartDistance + maxDistance)
-                {
-                    // 可达：移到距离目标 chaseStartDistance 处
-                    _chaseDestination = new Vector3(
-                        targetPos.x - dir.x * chaseStartDistance,
-                        _chaseStartPos.y,
-                        targetPos.z - dir.z * chaseStartDistance
-                    );
-                }
-                else
-                {
-                    // 太远：从起点向目标方向最多追 maxDistance
-                    _chaseDestination = new Vector3(
-                        _chaseStartPos.x + dir.x * maxDistance,
-                        _chaseStartPos.y,
-                        _chaseStartPos.z + dir.z * maxDistance
-                    );
-                }
-            }
+            _chaseWillMove = MonsterChaseTiming.TryEvaluateDestination(
+                _chaseConfig,
+                _chaseStartPos,
+                targetPos,
+                out _chaseDestination
+            );
 
             // 停 Follower 让位（经 Model 事实，MoveModule 执行；施放结束由 AI 恢复）
             _model.SetMoveCommand(new MonsterMoveCommand { IsStopped = true });
         }
 
         /// <summary>
-        /// 追击窗口内每 tick：限角旋转（朝向当前目标位置）+ 限距位移（固定落点 lerp）+ 可选撞伤。
+        /// 追击窗口内每 tick（权威端）：限角旋转（朝向当前目标位置）+ 限距位移（固定落点 lerp）。
         /// </summary>
         private void StepChase(float t)
         {
@@ -170,17 +151,17 @@ namespace Game.Entities
 
             if (_chaseWillMove)
             {
-                body.position = Vector3.Lerp(_chaseStartPos, _chaseDestination, t);
-            }
-
-            if (_chaseConfig.ContactDamage > 0)
-            {
-                SettleContactDamage();
+                body.position = MonsterChaseTiming.EvaluatePosition(
+                    _chaseStartPos,
+                    _chaseDestination,
+                    true,
+                    t
+                );
             }
         }
 
         /// <summary>
-        /// 撞伤检测：共享结算管线（基类 SettleSphereDamage），同目标窗口内一次。
+        /// 撞伤检测（各端受击方本地结算）：共享结算管线，同目标窗口内一次（本端去重集）。
         /// </summary>
         private void SettleContactDamage()
         {

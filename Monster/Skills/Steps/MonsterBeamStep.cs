@@ -12,7 +12,10 @@ namespace Game.Entities
     public class MonsterBeamStepConfig : MonsterSkillStepConfig
     {
         [Header("References")]
-        [Tooltip("光束发射挂点（如嘴部骨骼；特效亦挂此点）")]
+        [Tooltip("本体 Transform（yaw 匀角速转向目标 + 光束水平向来源；空时旋转跳过、水平向兜底发射挂点前向）")]
+        public Transform Body;
+
+        [Tooltip("光束发射挂点（如嘴部骨骼）")]
         public Transform MouthTransform;
 
         [Tooltip("发射挂点兜底（MouthTransform 为空时使用，如怪物自身 Transform）")]
@@ -24,6 +27,9 @@ namespace Game.Entities
 
         [Tooltip("吐息时长（秒；充能结束后持续伤害与追踪）")]
         public float BeamDuration = 7.2f;
+
+        [Tooltip("本体 yaw 匀角速转向目标（度/秒；充能起点至内容结束，光束水平跟踪只由身体转动承担）")]
+        public float TurnSpeed = 120f;
 
         [Tooltip("光束半径（米，SphereCast 判定）")]
         public float BeamRadius = 0.3f;
@@ -48,25 +54,26 @@ namespace Game.Entities
         public float HitForce = 5f;
 
         [Header("Effects")]
-        [Tooltip("充能特效 prefab（纯表现，各端本地实例化，充能结束时自毁）")]
-        public GameObject ChargingEffectPrefab;
+        [Tooltip("充能特效（预挂于怪物 prefab、默认隐藏；进入步骤播放，充能结束隐藏；摆放以 prefab 预挂为准）")]
+        public ParticleSystem ChargingEffect;
 
-        [Tooltip("光束特效 prefab（纯表现，各端本地实例化，吐息开始时生成、窗口结束销毁）")]
-        public GameObject BeamEffectPrefab;
+        [Tooltip("光束线渲染器（预挂于怪物 prefab、默认隐藏；吐息期由步骤每帧驱动端点 = 挂点 → 视觉射线终点）")]
+        public LineRenderer BeamRenderer;
 
-        [Tooltip("特效相对挂点的本地位置偏移")]
-        public Vector3 EffectOffset = Vector3.zero;
-
-        [Tooltip("特效相对挂点的本地旋转（欧拉角）")]
-        public Vector3 EffectRotation = Vector3.zero;
+        [Tooltip("击中特效（预挂于怪物 prefab、默认隐藏；视觉射线命中时移动到终点播放，未命中隐藏）")]
+        public ParticleSystem HitEffect;
 
         public override float Duration => ChargeDuration + BeamDuration;
     }
 
     /// <summary>
-    /// 持续追踪光束步骤（§16.4）：充能 → 吐息（持续伤害 + 追踪目标）。
-    /// 权威端吐息期每 tick 沿挂点 → 目标方向 SphereCast（障碍截断），同目标按 DamageTickInterval 去重；
-    /// 光束方向追踪（不旋转骨骼）；各端本地播充能 / 光束特效。
+    /// 持续追踪光束步骤：充能 → 吐息（持续伤害 + 追踪目标）。
+    /// 本体 yaw 匀角速转向目标（权威端驱动、NetworkTransform 同步代理端；Enter 停 Follower 让位），
+    /// 光束水平向锁定本体前向——水平跟踪只由身体转动承担，俯仰按目标高度即时瞄准；
+    /// 各端吐息期每 tick 沿挂点 → 本方向本端 SphereCast（障碍截断）结算
+    /// （受击方本地结算 §1.7——判定几何与各端视觉光束同源，同目标按 DamageTickInterval 去重）；
+    /// 每帧视觉更新驱动预挂特效（零实例化）：充能粒子播 / 停、
+    /// 光束线端点（挂点 → 本地细射线命中 / 最远点，ObstacleLayer | DamageLayer 截断）、击中特效显隐。
     /// </summary>
     public class MonsterBeamStep : MonsterSkillStep
     {
@@ -74,17 +81,11 @@ namespace Game.Entities
 
         private readonly RaycastHit[] _castBuffer = new RaycastHit[16];
 
-        /// <summary> 权威端：同目标最近命中时间（tick 间隔去重） </summary>
+        /// <summary> 本端：同目标最近命中时间（tick 间隔去重，各端独立） </summary>
         private readonly Dictionary<EntityId, float> _lastHitTimes = new();
 
-        /// <summary> 本端：充能特效实例（充能结束时自毁） </summary>
-        private GameObject _chargingEffectObj;
-
-        /// <summary> 本端：光束特效实例（窗口结束 / 打断时销毁） </summary>
-        private GameObject _beamEffectObj;
-
-        /// <summary> 本端：光束是否已生成 </summary>
-        private bool _beamSpawned;
+        /// <summary> 本端：吐息窗口是否已开始（充能结束时置位） </summary>
+        private bool _beamActive;
 
         public MonsterBeamStep(MonsterModel model, MonsterBeamStepConfig config)
             : base(model, config)
@@ -96,62 +97,74 @@ namespace Game.Entities
         {
             if (_beamConfig is null) return;
 
-            _beamSpawned = false;
+            _beamActive = false;
             _lastHitTimes.Clear();
-            _chargingEffectObj = null;
-            _beamEffectObj = null;
 
-            SpawnChargingEffect();
+            if (_beamConfig.Body == null)
+            {
+                Logging.Error("[MonsterBeamStep] OnStepEnter: Body 为 null，身体转向与光束水平锁定不可用"
+                              + "（水平向兜底发射挂点前向），请检查 Inspector 引用。");
+            }
+
+            // 权威端：停 Follower 让位（施放期间由步骤驱动本体旋转，Chase 同款；施法结束 AI 恢复寻路）
+            if (HasStateAuthority)
+            {
+                _model.SetMoveCommand(new MonsterMoveCommand { IsStopped = true });
+            }
+
+            ShowEffect(_beamConfig.ChargingEffect);
         }
 
         protected override void OnStepTick(float elapsed)
         {
             if (_beamConfig is null) return;
 
-            float stepElapsed = elapsed - _config.StartOffset;
-
-            // 各端本地：充能结束 → 生成光束（方向 = 本端计算的光束方向）
-            if (!_beamSpawned && stepElapsed >= _beamConfig.ChargeDuration)
+            // 本体 yaw 匀角速转向目标（权威端；充能起点至内容结束，无目标不转，姿态经 NetworkTransform 同步）
+            if (HasStateAuthority && !IsContentEnded)
             {
-                _beamSpawned = true;
-                SpawnBeamEffect();
+                TurnBodyTowardTarget();
             }
 
-            if (!HasStateAuthority) return;
+            float stepElapsed = elapsed - _config.StartOffset;
 
-            // 权威端：吐息期每 tick 结算
-            if (stepElapsed < _beamConfig.ChargeDuration) return;
-            if (stepElapsed >= _beamConfig.ChargeDuration + _beamConfig.BeamDuration) return;
+            // 各端本地：充能结束 → 进入吐息（隐藏充能特效、显示光束线并立即驱动一次端点）
+            if (!_beamActive && stepElapsed >= MonsterBeamTiming.GetBeamStartTime(_beamConfig))
+            {
+                _beamActive = true;
+
+                HideEffect(_beamConfig.ChargingEffect);
+                ShowBeam();
+            }
+
+            // 各端：吐息期每 tick 结算（受击方本地，§1.7）
+            if (!MonsterBeamTiming.IsDamageActive(_beamConfig, stepElapsed)) return;
 
             SettleBeam();
+        }
+
+        protected override void OnStepVisualUpdate(float elapsed)
+        {
+            if (_beamConfig is null) return;
+            if (!_beamActive) return;
+
+            UpdateBeamVisual();
         }
 
         protected override void OnStepExit()
         {
             _lastHitTimes.Clear();
+            _beamActive = false;
 
-            if (_chargingEffectObj != null)
-            {
-                UnityEngine.Object.Destroy(_chargingEffectObj);
-                _chargingEffectObj = null;
-            }
-
-            if (_beamEffectObj != null)
-            {
-                UnityEngine.Object.Destroy(_beamEffectObj);
-                _beamEffectObj = null;
-            }
-        }
-
-        protected override void OnStepAuthorityChanged()
-        {
-            _lastHitTimes.Clear();
+            HideEffect(_beamConfig?.ChargingEffect);
+            HideBeam();
+            HideEffect(_beamConfig?.HitEffect);
         }
 
         #region Private Methods
 
         /// <summary>
-        /// 权威端光束结算：SphereCast（挂点 → 光束方向，障碍截断），同目标 tick 间隔去重。
+        /// 光束结算（各端受击方本地）：SphereCast（挂点 → 光束方向，障碍截断），
+        /// 仅结算 SA 在本端的目标，同目标 tick 间隔去重（非本端目标不记录去重）。
         /// </summary>
         private void SettleBeam()
         {
@@ -185,7 +198,7 @@ namespace Game.Entities
                 QueryTriggerInteraction.Ignore
             );
 
-            float now = HasStateAuthority ? Time.time : 0f;
+            float now = Time.time;
             for (int i = 0; i < count; i++)
             {
                 var hit = _castBuffer[i];
@@ -196,6 +209,9 @@ namespace Game.Entities
 
                 EntityId targetId = tag.Id;
                 if (!targetId.IsValid) continue;
+
+                // 受击方本地结算（§1.7）：非本端目标不结算、不记录去重，交目标权威端自己判定
+                if (!MonsterSkillDamage.IsTargetAuthoritativeHere(targetId)) continue;
 
                 // 同目标 tick 间隔去重
                 if (_beamConfig.DamageTickInterval > 0f
@@ -210,7 +226,9 @@ namespace Game.Entities
 
                 var hitData = new HitData
                 {
-                    HitPoint = hit.point, HitDirection = direction, Force = _beamConfig.HitForce,
+                    HitPoint = hit.point,
+                    HitDirection = direction,
+                    Force = _beamConfig.HitForce,
                 };
 
                 Msger.Send(MsgID.ApplyDamage, targetId, damageData);
@@ -219,26 +237,49 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 光束方向：目标位置 − 挂点位置（水平 + 垂直全向追踪；无目标时挂点 forward 兜底）。
+        /// 光束方向（水平锁定 / 垂直自由）：水平向 = 本体前向水平投影（Body 未接线兜底发射挂点前向），
+        /// 俯仰 = 目标高度即时瞄准（无目标 pitch 0）；几何收在 MonsterBeamTiming（Editor 预演共享）。
         /// </summary>
         private Vector3 ResolveBeamDirection(Transform mouth)
         {
-            Vector3 direction = mouth.forward;
-            if (_model.CastTargetId.IsValid
-                && TryGetTargetPosition(_model.CastTargetId, out var targetPos))
-            {
-                direction = targetPos - mouth.position;
-                if (direction.sqrMagnitude > 0.001f)
-                {
-                    direction = direction.normalized;
-                }
-                else
-                {
-                    direction = mouth.forward;
-                }
-            }
+            Vector3 targetPos = default;
+            bool hasTarget = _model.CastTargetId.IsValid
+                             && TryGetTargetPosition(_model.CastTargetId, out targetPos);
+            return MonsterBeamTiming.ResolveDirection(
+                mouth.position,
+                ResolveYawForward(mouth),
+                hasTarget,
+                targetPos
+            );
+        }
 
-            return direction;
+        private Vector3 ResolveYawForward(Transform mouth)
+        {
+            if (_beamConfig.Body != null) return _beamConfig.Body.forward;
+            return mouth != null ? mouth.forward : Vector3.forward;
+        }
+
+        /// <summary>
+        /// 本体 yaw 匀角速转向目标（权威端 FUN tick）：目标向量水平投影 LookRotation +
+        /// RotateTowards（无总角限）；无目标 / 水平距退化不转，结束与打断均不恢复朝向。
+        /// 经 Model.PushBodyRotation 由 MoveModule 落地——updateRotation 开启时
+        /// FollowerEntity 的 ECS 同步系统每帧把内部旋转写回 transform，
+        /// 步骤直写 body.rotation 会被当场拽回（A* 兼容层内聚于 MoveModule）。
+        /// </summary>
+        private void TurnBodyTowardTarget()
+        {
+            var body = _beamConfig.Body;
+            if (body == null) return;
+            if (!TryGetTargetPosition(_model.CastTargetId, out var targetPos)) return;
+
+            Vector3 toTarget = targetPos - body.position;
+            toTarget.y = 0f;
+            if (toTarget.sqrMagnitude < 0.001f) return;
+
+            Quaternion desiredRot = Quaternion.LookRotation(toTarget);
+            float maxDegrees = _beamConfig.TurnSpeed * Mathf.Max(0f, (float)_model.Runner.DeltaTime);
+
+            _model.PushBodyRotation(Quaternion.RotateTowards(body.rotation, desiredRot, maxDegrees));
         }
 
         private Transform ResolveMouth()
@@ -248,53 +289,97 @@ namespace Game.Entities
                 : _beamConfig.FallbackTransform;
         }
 
-        private void SpawnChargingEffect()
+        /// <summary>
+        /// 每帧视觉更新（各端本地）：光束方向 → 细射线取视觉终点（ObstacleLayer | DamageLayer 截断，
+        /// 未命中取最远点）→ 驱动光束线端点与击中特效显隐。与权威端 SphereCast 伤害判定互相独立，
+        /// 细射线与球判定的擦边偏差可接受。
+        /// </summary>
+        private void UpdateBeamVisual()
         {
-            if (_beamConfig.ChargingEffectPrefab == null) return;
-
             var mouth = ResolveMouth();
             if (mouth == null) return;
 
-            _chargingEffectObj = SpawnEffect(_beamConfig.ChargingEffectPrefab, mouth);
-            if (_chargingEffectObj != null)
+            Vector3 origin = mouth.position;
+            Vector3 direction = ResolveBeamDirection(mouth);
+            if (direction.sqrMagnitude < 0.001f) return;
+
+            bool hasHit = Physics.Raycast(
+                origin,
+                direction,
+                out RaycastHit hit,
+                _beamConfig.BeamMaxDistance,
+                _beamConfig.ObstacleLayer | _beamConfig.DamageLayer,
+                QueryTriggerInteraction.Ignore
+            );
+            Vector3 endPoint = hasHit ? hit.point : origin + direction * _beamConfig.BeamMaxDistance;
+
+            if (_beamConfig.BeamRenderer != null)
             {
-                float chargeTime = Mathf.Max(0.1f, _beamConfig.ChargeDuration);
-                UnityEngine.Object.Destroy(_chargingEffectObj, chargeTime);
+                _beamConfig.BeamRenderer.SetPosition(0, origin);
+                _beamConfig.BeamRenderer.SetPosition(1, endPoint);
             }
+
+            UpdateHitEffect(hasHit, endPoint);
         }
 
-        private void SpawnBeamEffect()
+        private void ShowBeam()
         {
-            if (_beamConfig.BeamEffectPrefab == null)
+            if (_beamConfig.BeamRenderer == null)
             {
-                Logging.Error("[MonsterBeamStep] SpawnBeamEffect: BeamEffectPrefab 为 null，请检查 Inspector 引用。");
+                Logging.Error("[MonsterBeamStep] ShowBeam: BeamRenderer 为 null，请检查 Inspector 引用。");
                 return;
             }
 
-            var mouth = ResolveMouth();
-            if (mouth == null) return;
+            _beamConfig.BeamRenderer.gameObject.SetActive(true);
 
-            _beamEffectObj = SpawnEffect(_beamConfig.BeamEffectPrefab, mouth);
-            if (_beamEffectObj != null)
+            // 立即驱动一次端点，避免显示序列化残留端点一帧
+            UpdateBeamVisual();
+        }
+
+        private void HideBeam()
+        {
+            if (_beamConfig?.BeamRenderer == null) return;
+
+            _beamConfig.BeamRenderer.gameObject.SetActive(false);
+        }
+
+        private void UpdateHitEffect(bool hasHit, Vector3 endPoint)
+        {
+            var hitEffect = _beamConfig.HitEffect;
+            if (hitEffect == null) return;
+
+            if (hasHit)
             {
-                // 光束朝向 = 本端计算方向（端点跟随由 prefab 内部处理）
-                Vector3 direction = ResolveBeamDirection(mouth);
-                if (direction.sqrMagnitude > 0.001f)
+                if (!hitEffect.gameObject.activeSelf)
                 {
-                    _beamEffectObj.transform.rotation = Quaternion.LookRotation(direction);
+                    hitEffect.gameObject.SetActive(true);
                 }
+                hitEffect.transform.position = endPoint;
+                if (!hitEffect.isPlaying)
+                {
+                    hitEffect.Play(true);
+                }
+            }
+            else
+            {
+                HideEffect(hitEffect);
             }
         }
 
-        /// <summary>
-        /// 各端本地实例化特效（挂点 + 本地偏移 / 旋转），返回实例供步骤管理生命周期。
-        /// </summary>
-        private GameObject SpawnEffect(GameObject prefab, Transform attach)
+        private static void ShowEffect(ParticleSystem effect)
         {
-            var effectObj = UnityEngine.Object.Instantiate(prefab, attach.position, attach.rotation, attach);
-            effectObj.transform.localPosition = _beamConfig.EffectOffset;
-            effectObj.transform.localEulerAngles = _beamConfig.EffectRotation;
-            return effectObj;
+            if (effect == null) return;
+
+            effect.gameObject.SetActive(true);
+            effect.Play(true);
+        }
+
+        private static void HideEffect(ParticleSystem effect)
+        {
+            if (effect == null) return;
+
+            effect.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            effect.gameObject.SetActive(false);
         }
 
         #endregion

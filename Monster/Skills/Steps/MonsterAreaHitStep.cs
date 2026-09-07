@@ -38,10 +38,10 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 范围结算步骤：自圆心 OverlapSphere 结算（共享结算管线）。
-    /// 窗口式（Window > 0）：窗口内每 tick 检测，同目标窗口内一次；
-    /// 点式（Window = 0）：Enter 时刻一次性结算（即 Combo 段窗口与 PulseArea 时间点的共同原子，§16.4）。
-    /// 权威端结算；无本地表现。
+    /// 范围结算步骤：自圆心 OverlapSphere 结算（共享结算管线，受击方本地结算 §1.7）。
+    /// 窗口式（Window > 0）：窗口内每 tick 检测，同目标窗口内一次（本端去重集）；
+    /// 点式（Window = 0）：Enter 时刻一次性结算（即 Combo 段窗口与 PulseArea 时间点的共同原子）。
+    /// 各端本端时钟推进；无本地表现。
     /// </summary>
     public class MonsterAreaHitStep : MonsterSkillStep
     {
@@ -61,8 +61,6 @@ namespace Game.Entities
             if (_areaConfig is null) return;
 
             // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）
-            if (!HasStateAuthority) return;
-
             _hitTargets.Clear();
 
             if (_areaConfig.Window > 0f) return;
@@ -74,19 +72,14 @@ namespace Game.Entities
         protected override void OnStepTick(float elapsed)
         {
             if (_areaConfig is null) return;
-            if (!HasStateAuthority) return;
             if (_areaConfig.Window <= 0f) return;
+            if (IsContentEnded) return;
 
-            // 窗口式：每 tick 检测（去重集窗口内每目标一次）
+            // 窗口式：每 tick 检测（本端去重集，窗口内每目标一次；收尾段不结算）
             Settle();
         }
 
         protected override void OnStepExit()
-        {
-            _hitTargets.Clear();
-        }
-
-        protected override void OnStepAuthorityChanged()
         {
             _hitTargets.Clear();
         }

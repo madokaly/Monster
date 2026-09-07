@@ -10,7 +10,8 @@ namespace Game.Entities
     /// 步骤 Enter / Tick / Exit；链级进入动画由 Model.TryCastChain 内部级联写入（§1.4 硬约束），
     /// 步骤进入动画（StepAnimIds 随机）由权威端时间线 tick 经 Model 写 AnimId
     /// （[Networked] 状态事实，全端播放）；链 / 步骤特效与音效各端本地随机播（§16.3）。
-    /// 判定与结算在步骤内部按 HasStateAuthority 分流（§16.3）；链身份 = 链索引（Model.CastingChainIndex）。
+    /// 行为逻辑（移动 / 选点 / 状态写入）在步骤内部按 HasStateAuthority 分流，
+    /// 伤害判定与结算恒为受击方本地结算（§1.7）；链身份 = 链索引（Model.CastingChainIndex）。
     /// </summary>
     public class MonsterSkillChainRunner : ModuleBase
     {
@@ -136,6 +137,18 @@ namespace Game.Entities
             AdvanceTimeline(CastElapsed);
         }
 
+        protected override void OnLateUpdate(float deltaTime)
+        {
+            // 每帧视觉更新（权威 / 代理统一每帧节奏，Ctrl LateUpdate 转发）：仅活跃步骤
+            if (!_casting || _activeStepIndex < 0) return;
+
+            var active = _steps[_activeStepIndex];
+            if (active != null && active.IsActive)
+            {
+                active.VisualUpdate(CastElapsed);
+            }
+        }
+
         #endregion
 
         #region Timeline
@@ -150,14 +163,14 @@ namespace Game.Entities
             if (_steps is not { Length: > 0 }) return;
             if (elapsed <= 0f) return;
 
-            // 退出：活跃步骤窗口已结束（到期或已被后续步骤打断）
+            // 退出：活跃步骤窗口已结束（内容 + 收尾延迟到期，或已被后续步骤打断）
             if (_activeStepIndex >= 0)
             {
                 var active = _steps[_activeStepIndex];
                 if (active != null && active.IsActive)
                 {
                     var activeConfig = _chain.Steps[_activeStepIndex];
-                    if (elapsed >= activeConfig.StartOffset + activeConfig.Duration)
+                    if (elapsed >= activeConfig.StartOffset + activeConfig.TotalDuration)
                     {
                         active.Exit();
                     }
@@ -203,8 +216,8 @@ namespace Game.Entities
                 EnterStep(nextIndex, elapsed);
                 _activeStepIndex = nextIndex;
 
-                // 点式步骤：进入即一次性结算，立即退出
-                if (nextConfig.Duration <= 0f)
+                // 零窗口步骤（点式且无收尾延迟）：进入即一次性结算，立即退出
+                if (nextConfig.TotalDuration <= 0f)
                 {
                     nextStep.Exit();
                 }

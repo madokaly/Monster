@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using Framework;
 using Framework.Core;
 using Game.Components;
-using Game.DTOs;
 using UnityEngine;
 
 namespace Game.Entities
@@ -54,19 +53,25 @@ namespace Game.Entities
         [Header("Effects")]
         [Tooltip("追踪圈特效 prefab（纯表现，各端本地实例化于目标脚下并跟随）")]
         public GameObject TrackingEffectPrefab;
+        public Vector3 TrackingEffectPosOffset = Vector3.zero;
+        public Vector3 TrackingEffectRotOffset = Vector3.zero;
 
         [Tooltip("锁定标记特效 prefab（纯表现，锁定时刻实例化于锁定位置）")]
         public GameObject LockEffectPrefab;
+        public Vector3 LockEffectPosOffset = Vector3.zero;
+        public Vector3 LockEffectRotOffset = Vector3.zero;
 
         [Tooltip("导弹 + 爆炸特效 prefab（纯表现，自带下落编排与爆炸音效；各端本地在导弹生成时刻实例化）")]
         public GameObject BombEffectPrefab;
-
-        [Tooltip("特效相对目标 / 锁定位置的世界空间偏移")]
-        public Vector3 EffectOffset = Vector3.zero;
+        public Vector3 BombEffectPosOffset = Vector3.zero;
+        public Vector3 BombEffectRotOffset = Vector3.zero;
 
         [Header("Sounds")]
+        [Tooltip("追踪瞄准音效（空 = 不播）")]
+        public string TrackingSoundPath;
+
         [Tooltip("锁定瞄准音效（空 = 不播）")]
-        public string AimingSoundPath;
+        public string LockedSoundPath;
 
         [Tooltip("导弹发射音效（空 = 不播）")]
         public string MissileSoundPath;
@@ -76,19 +81,19 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 定点轰炸步骤（§16.4）：定位附近目标 → 追踪圈跟随 → 锁定 → 多段轰炸（圆心在锁定位置）。
-    /// 权威端按锁定位置在爆炸时刻逐段结算（每段每目标一次）；目标选择与锁定位置各端本地解析
-    /// （同一物理世界输入，偏差罕见且只影响表现，判定以权威端为准——§1.7 本地自洽）；
+    /// 定点轰炸步骤：定位附近目标 → 追踪圈跟随 → 锁定 → 多段轰炸（圆心在锁定位置）。
+    /// 目标选择与锁定位置各端本地解析；各端在爆炸时刻按本端锁定位置逐段结算
+    /// （受击方本地结算 §1.7——判定基准与本端轰炸表现同源，所见即所得，每段每目标一次）；
     /// 追踪圈跟随 / 锁定标记 / 导弹特效各端本地时钟播放。
     /// </summary>
     public class MonsterBombingStep : MonsterSkillStep
     {
         private readonly MonsterBombingStepConfig _bombingConfig;
 
-        /// <summary> 本端选择的目标（表现跟随 / 权威结算基准；各端各自解析） </summary>
+        /// <summary> 本端选择的目标（表现跟随 / 锁定位置解析来源；各端各自解析） </summary>
         private readonly List<EntityId> _targetIds = new();
 
-        /// <summary> 锁定位置（本端解析；权威端用于结算） </summary>
+        /// <summary> 锁定位置（本端解析；本端结算基准，§1.7） </summary>
         private readonly List<Vector3> _lockedPositions = new();
 
         /// <summary> 本端：追踪圈特效实例（与 _targetIds 对齐；目标丢失置 null） </summary>
@@ -105,17 +110,13 @@ namespace Game.Entities
         /// <summary> 本端：下一个待生成导弹的段索引 </summary>
         private int _nextBombSpawnIndex;
 
-        /// <summary> 权威端：下一个待结算的段索引 </summary>
+        /// <summary> 本端：下一个待结算的段索引 </summary>
         private int _nextBombSettleIndex;
 
         /// <summary> 定位碰撞体缓冲 </summary>
         private readonly Collider[] _locateBuffer = new Collider[32];
 
-        /// <summary> 爆炸结算碰撞体缓冲 </summary>
-        private readonly Collider[] _overlapBuffer = new Collider[32];
-
-        public MonsterBombingStep(MonsterModel model, MonsterBombingStepConfig config)
-            : base(model, config)
+        public MonsterBombingStep(MonsterModel model, MonsterBombingStepConfig config) : base(model, config)
         {
             _bombingConfig = config;
         }
@@ -155,11 +156,6 @@ namespace Game.Entities
         {
             DestroyAllEffects();
             ResetAll();
-        }
-
-        protected override void OnStepAuthorityChanged()
-        {
-            _nextBombSettleIndex = 0;
         }
 
         #region Targeting
@@ -215,9 +211,13 @@ namespace Game.Entities
                 {
                     effect = UnityEngine.Object.Instantiate(
                         _bombingConfig.TrackingEffectPrefab,
-                        targetPos + _bombingConfig.EffectOffset,
-                        Quaternion.identity
+                        targetPos + _bombingConfig.TrackingEffectPosOffset,
+                        Quaternion.Euler(_bombingConfig.TrackingEffectRotOffset)
                     );
+                    if (!string.IsNullOrEmpty(_bombingConfig.TrackingSoundPath))
+                    {
+                        AudioMgr.Play(_bombingConfig.TrackingSoundPath, effect.transform);
+                    }
                 }
                 _trackingEffects.Add(effect);
             }
@@ -233,10 +233,9 @@ namespace Game.Entities
                 var effect = _trackingEffects[i];
                 if (effect == null) continue;
 
-                if (i < _targetIds.Count
-                    && TryGetTargetPosition(_targetIds[i], out var targetPos))
+                if (i < _targetIds.Count && TryGetTargetPosition(_targetIds[i], out var targetPos))
                 {
-                    effect.transform.position = targetPos + _bombingConfig.EffectOffset;
+                    effect.transform.position = targetPos + _bombingConfig.TrackingEffectPosOffset;
                 }
                 else
                 {
@@ -277,17 +276,18 @@ namespace Game.Entities
                 _lockEffects.Clear();
                 for (int i = 0; i < _lockedPositions.Count; i++)
                 {
-                    _lockEffects.Add(
-                        UnityEngine.Object.Instantiate(
-                            _bombingConfig.LockEffectPrefab,
-                            _lockedPositions[i] + _bombingConfig.EffectOffset,
-                            Quaternion.identity
-                        )
+                    var lockEffect = UnityEngine.Object.Instantiate(
+                        _bombingConfig.LockEffectPrefab,
+                        _lockedPositions[i] + _bombingConfig.LockEffectPosOffset,
+                        Quaternion.Euler(_bombingConfig.LockEffectRotOffset)
                     );
+                    _lockEffects.Add(lockEffect);
+                    if (!string.IsNullOrEmpty(_bombingConfig.LockedSoundPath))
+                    {
+                        AudioMgr.Play(_bombingConfig.LockedSoundPath, lockEffect.transform);
+                    }
                 }
             }
-
-            PlaySound(_bombingConfig.AimingSoundPath);
         }
 
         #endregion
@@ -300,23 +300,20 @@ namespace Game.Entities
         /// </summary>
         private void UpdateBombs(float stepElapsed)
         {
-            float spawnBase = _bombingConfig.TrackDuration + _bombingConfig.LockDelay;
-
             // 各端本地：导弹特效生成 + 发射音效
             while (_nextBombSpawnIndex < _bombingConfig.BombWaves
-                   && stepElapsed >= spawnBase + _nextBombSpawnIndex * _bombingConfig.BombInterval)
+                   && stepElapsed >= MonsterBombingTiming.GetBombSpawnTime(_bombingConfig, _nextBombSpawnIndex))
             {
                 SpawnBombEffects();
-                PlaySound(_bombingConfig.MissileSoundPath);
                 _nextBombSpawnIndex++;
             }
 
-            // 权威端：爆炸结算
-            while (HasStateAuthority
-                   && _nextBombSettleIndex < _bombingConfig.BombWaves
-                   && stepElapsed >= spawnBase
-                       + _nextBombSettleIndex * _bombingConfig.BombInterval
-                       + _bombingConfig.BombFallDuration)
+            // 各端：爆炸结算（受击方本地，§1.7，本端锁定位置为圆心）
+            while (_nextBombSettleIndex < _bombingConfig.BombWaves
+                   && stepElapsed >= MonsterBombingTiming.GetBombSettleTime(
+                       _bombingConfig,
+                       _nextBombSettleIndex
+                   ))
             {
                 SettleBomb();
                 _nextBombSettleIndex++;
@@ -333,18 +330,22 @@ namespace Game.Entities
             _bombEffects.Clear();
             for (int i = 0; i < _lockedPositions.Count; i++)
             {
-                _bombEffects.Add(
-                    UnityEngine.Object.Instantiate(
-                        _bombingConfig.BombEffectPrefab,
-                        _lockedPositions[i] + _bombingConfig.EffectOffset,
-                        Quaternion.identity
-                    )
+                var bombEffect = UnityEngine.Object.Instantiate(
+                    _bombingConfig.BombEffectPrefab,
+                    _lockedPositions[i] + _bombingConfig.BombEffectPosOffset,
+                    Quaternion.Euler(_bombingConfig.BombEffectRotOffset)
                 );
+                _bombEffects.Add(bombEffect);
+                if (!string.IsNullOrEmpty(_bombingConfig.MissileSoundPath))
+                {
+                    AudioMgr.Play(_bombingConfig.MissileSoundPath, bombEffect.transform);
+                }
             }
         }
 
         /// <summary>
-        /// 权威端单段结算：每个锁定位置一次 OverlapSphere，每段每目标一次（多圈重叠去重）。
+        /// 单段结算（各端受击方本地结算，§1.7）：每个锁定位置一次球形结算，
+        /// 共享去重集（每段每目标一次，多圈重叠去重），复用基类共享管线。
         /// </summary>
         private void SettleBomb()
         {
@@ -355,55 +356,22 @@ namespace Game.Entities
 
             for (int i = 0; i < _lockedPositions.Count; i++)
             {
-                Vector3 center = _lockedPositions[i];
-
-                int count = Physics.OverlapSphereNonAlloc(
-                    center,
+                SettleSphereDamage(
+                    _lockedPositions[i],
                     _bombingConfig.ExplosionRadius,
-                    _overlapBuffer,
                     _bombingConfig.DamageLayer,
-                    QueryTriggerInteraction.Ignore
+                    0f,
+                    _bombingConfig.Damage,
+                    _bombingConfig.HitForce,
+                    hitTargets,
+                    self.forward
                 );
-
-                for (int j = 0; j < count; j++)
-                {
-                    var col = _overlapBuffer[j];
-                    if (col == null) continue;
-
-                    var tag = col.GetComponentInParent<EntityTag>();
-                    if (tag == null) continue;
-
-                    EntityId targetId = tag.Id;
-                    if (!targetId.IsValid) continue;
-                    if (!hitTargets.Add(targetId)) continue;
-
-                    Vector3 hitPoint = col.transform.position;
-                    Vector3 hitDirection = hitPoint - center;
-                    hitDirection.y = 0f;
-                    hitDirection = hitDirection.sqrMagnitude > 0.001f ? hitDirection.normalized : self.forward;
-
-                    var damageData = new DamageData { Damage = _bombingConfig.Damage, AttackerId = _model.Id, };
-
-                    var hitData = new HitData
-                    {
-                        HitPoint = hitPoint, HitDirection = hitDirection, Force = _bombingConfig.HitForce,
-                    };
-
-                    Msger.Send(MsgID.ApplyDamage, targetId, damageData);
-                    Msger.Send(MsgID.ApplyHit, targetId, hitData);
-                }
             }
         }
 
         #endregion
 
         #region Private Methods
-
-        private void PlaySound(string soundPath)
-        {
-            if (string.IsNullOrEmpty(soundPath)) return;
-            if (_bombingConfig.SelfTransform != null) AudioMgr.Play(soundPath, _bombingConfig.SelfTransform);
-        }
 
         private void DestroyAllEffects()
         {

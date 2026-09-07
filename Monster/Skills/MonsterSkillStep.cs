@@ -1,17 +1,19 @@
 using System.Collections.Generic;
 using Framework;
-using Framework.Core;
 using Framework.Network;
-using Game.Components;
-using Game.DTOs;
 using UnityEngine;
 
 namespace Game.Entities
 {
     /// <summary>
     /// 怪物技能原子步骤基类（运行时，由链运行器驱动，不自持生命周期、不监听 Model）。
-    /// 生命周期：Enter（窗口开始，全端；点式步骤 Enter 即 Exit）→ Tick（窗口内逐 tick，全端）→ Exit（窗口结束，全端）。
-    /// 权威端逻辑（判定与结算）与各端本地逻辑（特效）由步骤内部按 HasStateAuthority 分流（§16.3）；
+    /// 生命周期：Enter（窗口开始，全端）→ Tick（窗口内逐 tick，全端）→ Exit（窗口结束，全端）；
+    /// 窗口 = [StartOffset, StartOffset+TotalDuration]（内容 + 收尾延迟 EndOffset）——
+    /// 内容结束后进入收尾段：表现 / VisualUpdate 继续、Exit 清理延迟，伤害类逻辑经 IsContentEnded 守卫停止。
+    /// 零窗口步骤（TotalDuration = 0，点式且无收尾）Enter 即 Exit。
+    /// VisualUpdate（窗口内逐帧 LateUpdate，全端；供需要每帧平滑的表现驱动，如 Beam 端点跟随）。
+    /// 行为与状态逻辑（移动 / 选点 / 动画写入）由步骤内部按 HasStateAuthority 分流；
+    /// 伤害判定与结算恒为受击方本地结算（各端本端时钟 + 本端真实位置，§1.7）；
     /// 步骤实例装配期创建、施放间复用（Enter / Exit 时重置中间态）。
     /// </summary>
     public abstract class MonsterSkillStep
@@ -25,8 +27,8 @@ namespace Game.Entities
         /// <summary> 步骤窗口是否进行中（本端） </summary>
         public bool IsActive { get; private set; }
 
-        /// <summary> 球形范围结算的碰撞体缓冲（基类共享，各子类复用） </summary>
-        private readonly Collider[] _overlapBuffer = new Collider[32];
+        /// <summary> 步骤内容是否已结束（本端时钟越过内容时长；收尾段恒 true，供内容逻辑守卫） </summary>
+        protected bool IsContentEnded { get; private set; }
 
         protected MonsterSkillStep(MonsterModel model, MonsterSkillStepConfig config)
         {
@@ -39,6 +41,7 @@ namespace Game.Entities
         internal void Enter(float elapsed)
         {
             IsActive = true;
+            IsContentEnded = false;
 
             // 步骤进入表现（各端本地随机播，先于子类逻辑；与链级进入表现叠加，§16.3）
             if (_config != null)
@@ -52,7 +55,21 @@ namespace Game.Entities
 
         internal void Tick(float elapsed)
         {
+            // 内容结束边沿（本端时钟越过内容时长）：内容逻辑完成、步骤进入收尾段
+            if (!IsContentEnded
+                && _config != null
+                && elapsed >= _config.StartOffset + _config.Duration)
+            {
+                IsContentEnded = true;
+                OnStepContentEnded();
+            }
+
             OnStepTick(elapsed);
+        }
+
+        internal void VisualUpdate(float elapsed)
+        {
+            OnStepVisualUpdate(elapsed);
         }
 
         internal void Exit()
@@ -80,6 +97,15 @@ namespace Game.Entities
 
         protected virtual void OnStepTick(float elapsed) { }
 
+        protected virtual void OnStepVisualUpdate(float elapsed) { }
+
+        /// <summary>
+        /// 内容结束（本端时钟越过内容时长；随 Tick 边沿触发一次）。收尾段开始——
+        /// 表现继续、窗口延迟到 TotalDuration 结束；在此停伤 / 停内容逻辑。
+        /// 步骤在内容结束前被截断（打断 / 重叠截断）时不触发，收口走 OnStepExit。
+        /// </summary>
+        protected virtual void OnStepContentEnded() { }
+
         protected virtual void OnStepExit() { }
 
         protected virtual void OnStepDispose() { }
@@ -105,8 +131,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 球形范围结算（共享管线）：OverlapSphere → 高度过滤 → 身份解析（即用即弃）
-        /// → 组装 DamageData → ApplyDamage + ApplyHit。
+        /// 球形范围结算（共享管线 MonsterSkillDamage 的薄包装，受击方本地结算 §1.7）：
         /// hitTargets 由调用方维护（窗口内每目标一次，点间 / 段间可重复命中）；
         /// maxTargets > 0 时限制单次结算目标数（0 = 无限制）；maxAttackHeight <= 0 时不过滤高度。
         /// </summary>
@@ -123,52 +148,18 @@ namespace Game.Entities
         {
             if (_model is null) return;
 
-            int count = Physics.OverlapSphereNonAlloc(
+            MonsterSkillDamage.SettleSphere(
+                _model.Id,
                 center,
                 radius,
-                _overlapBuffer,
                 damageLayer,
-                QueryTriggerInteraction.Ignore
+                maxAttackHeight,
+                damage,
+                hitForce,
+                hitTargets,
+                fallbackDirection,
+                maxTargets
             );
-
-            int settled = 0;
-            for (int i = 0; i < count; i++)
-            {
-                if (maxTargets > 0 && settled >= maxTargets) break;
-
-                var col = _overlapBuffer[i];
-                if (col == null) continue;
-
-                // 高度过滤（maxAttackHeight > 0 时生效）
-                if (maxAttackHeight > 0f && Mathf.Abs(col.transform.position.y - center.y) > maxAttackHeight)
-                {
-                    continue;
-                }
-
-                // 身份解析：即用即弃，只提取 EntityId（§1.6）
-                var tag = col.GetComponentInParent<EntityTag>();
-                if (tag == null) continue;
-
-                EntityId targetId = tag.Id;
-                if (!targetId.IsValid) continue;
-                if (!hitTargets.Add(targetId)) continue;
-
-                Vector3 hitPoint = col.transform.position;
-                Vector3 hitDirection = hitPoint - center;
-                hitDirection.y = 0f;
-                hitDirection = hitDirection.sqrMagnitude > 0.001f ? hitDirection.normalized : fallbackDirection;
-
-                var damageData = new DamageData { Damage = damage, AttackerId = _model.Id, };
-
-                var hitData = new HitData
-                {
-                    HitPoint = hitPoint, HitDirection = hitDirection, Force = hitForce,
-                };
-
-                Msger.Send(MsgID.ApplyDamage, targetId, damageData);
-                Msger.Send(MsgID.ApplyHit, targetId, hitData);
-                settled++;
-            }
         }
 
         #endregion

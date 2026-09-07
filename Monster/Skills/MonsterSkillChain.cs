@@ -41,7 +41,8 @@ namespace Game.Entities
         public List<MonsterSkillStepConfig> Steps = new();
 
         /// <summary>
-        /// 链总时长（秒）：派生 max(StartOffset + Duration)，无显式字段（§1.1 单一可信源，避免双源不同步）。
+        /// 链总时长（秒）：派生 max(StartOffset + TotalDuration)（含步骤收尾延迟），
+        /// 无显式字段（§1.1 单一可信源，避免双源不同步）。
         /// </summary>
         public float CastDuration
         {
@@ -52,7 +53,7 @@ namespace Game.Entities
                 {
                     var step = Steps[i];
                     if (step == null) continue;
-                    max = Mathf.Max(max, step.StartOffset + step.Duration);
+                    max = Mathf.Max(max, step.StartOffset + step.TotalDuration);
                 }
                 return max;
             }

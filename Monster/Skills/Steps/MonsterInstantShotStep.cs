@@ -43,19 +43,20 @@ namespace Game.Entities
         [Tooltip("伤害结算延迟（秒，相对步骤起点；0 = Enter 时结算）")]
         public float DamageOffset;
 
-        public override float Duration => Mathf.Max(0f, DamageOffset);
+        public override float Duration => MonsterInstantShotTiming.GetDamageTime(this);
     }
 
     /// <summary>
-    /// 瞬发步骤（§16.4）：对 CastTargetId 直接结算（无弹道瞬伤，单目标；
+    /// 瞬发步骤：对 CastTargetId 直接结算（无弹道瞬伤，单目标；
     /// 射程筛选由 AI 决策层保证，不做二次 OverlapSphere）。
-    /// Enter 各端本地播炮口特效；权威端在 DamageOffset 后结算（0 = Enter 即结算）。
+    /// Enter 各端本地播炮口特效；各端在 DamageOffset 后尝试结算（0 = Enter 即尝试），
+    /// 仅目标 SA 在本端才由本端结算（受击方本地结算 §1.7，命中方向用本端真实位置）。
     /// </summary>
     public class MonsterInstantShotStep : MonsterSkillStep
     {
         private readonly MonsterInstantShotStepConfig _instantShotConfig;
 
-        /// <summary> 权威端：本次施放是否已结算（施放间复用需重置） </summary>
+        /// <summary> 本端：本次施放是否已结算（施放间复用需重置） </summary>
         private bool _damageResolved;
 
         public MonsterInstantShotStep(MonsterModel model, MonsterInstantShotStepConfig config) : base(model, config)
@@ -71,36 +72,49 @@ namespace Game.Entities
 
             PlayMuzzleEffect();
 
-            if (!HasStateAuthority) return;
-            if (_instantShotConfig.DamageOffset > 0f) return;
+            if (MonsterInstantShotTiming.GetDamageTime(_instantShotConfig) > 0f) return;
 
-            _damageResolved = true;
-            ResolveDamage();
+            TryResolveDamage();
         }
 
         protected override void OnStepTick(float elapsed)
         {
             if (_instantShotConfig is null) return;
-            if (!HasStateAuthority) return;
             if (_damageResolved) return;
-            if (_instantShotConfig.DamageOffset <= 0f) return;
+            float damageTime = MonsterInstantShotTiming.GetDamageTime(_instantShotConfig);
+            if (damageTime <= 0f) return;
 
-            if (elapsed < _config.StartOffset + _instantShotConfig.DamageOffset) return;
+            if (elapsed < _config.StartOffset + damageTime) return;
 
-            _damageResolved = true;
-            ResolveDamage();
+            TryResolveDamage();
         }
 
         #region Private Methods
 
         /// <summary>
-        /// 权威端结算：对 CastTargetId 直接 ApplyDamage / ApplyHit（方向取攻击者 → 目标当前位置）。
+        /// 到点尝试结算（各端本端时钟）：目标无效 → 落已结算标记收口；
+        /// 目标 SA 不在本端 → 不落标记（目标权威中途迁入本端时仍可补结算）。
         /// </summary>
-        private void ResolveDamage()
+        private void TryResolveDamage()
         {
             var targetId = _model.CastTargetId;
-            if (!targetId.IsValid) return;
+            if (!targetId.IsValid)
+            {
+                _damageResolved = true;
+                return;
+            }
 
+            if (!MonsterSkillDamage.IsTargetAuthoritativeHere(targetId)) return;
+
+            _damageResolved = true;
+            ResolveDamage(targetId);
+        }
+
+        /// <summary>
+        /// 结算：对 CastTargetId 直接 ApplyDamage / ApplyHit（方向取攻击者 → 目标当前位置）。
+        /// </summary>
+        private void ResolveDamage(EntityId targetId)
+        {
             var selfTransform = _instantShotConfig.SelfTransform;
             if (selfTransform == null) return;
 
@@ -124,12 +138,15 @@ namespace Game.Entities
 
             var damageData = new DamageData
             {
-                Damage = Mathf.Max(1, _instantShotConfig.Damage), AttackerId = _model.Id,
+                Damage = Mathf.Max(1, _instantShotConfig.Damage),
+                AttackerId = _model.Id,
             };
 
             var hitData = new HitData
             {
-                HitPoint = hitPoint, HitDirection = hitDirection, Force = _instantShotConfig.HitForce,
+                HitPoint = hitPoint,
+                HitDirection = hitDirection,
+                Force = _instantShotConfig.HitForce,
             };
 
             Msger.Send(MsgID.ApplyDamage, targetId, damageData);

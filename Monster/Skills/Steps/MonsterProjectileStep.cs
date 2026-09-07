@@ -94,21 +94,27 @@ namespace Game.Entities
             if (selfTransform == null) return;
 
             // 发射参数：权威端本地解析目标位置（即用即弃）
-            Vector3 spawnPos = selfTransform.position
-                               + selfTransform.rotation * _projectileConfig.SpawnOffset;
-            Vector3 aimPos = spawnPos + selfTransform.forward;
+            Vector3 spawnPos = MonsterProjectileTiming.GetSpawnPosition(_projectileConfig);
+            Vector3 aimPos = default;
+            bool hasTarget = false;
             if (_model.CastTargetId.IsValid)
             {
                 var targetObject = NetworkMgr.FindObject(_model.CastTargetId.NetId);
-                if (targetObject != null) aimPos = targetObject.transform.position;
+                if (targetObject != null)
+                {
+                    aimPos = targetObject.transform.position;
+                    hasTarget = true;
+                }
             }
 
-            Vector3 direction = aimPos - spawnPos;
-            if (direction.sqrMagnitude < 0.001f) direction = selfTransform.forward;
-            direction = direction.normalized;
-
-            float speed = _projectileConfig.ProjectileSpeed > 0f ? _projectileConfig.ProjectileSpeed : 20f;
-            float maxDistance = _projectileConfig.MaxDistance > 0f ? _projectileConfig.MaxDistance : 50f;
+            Vector3 direction = MonsterProjectileTiming.ResolveDirection(
+                _projectileConfig,
+                spawnPos,
+                hasTarget,
+                aimPos
+            );
+            float speed = MonsterProjectileTiming.GetSpeed(_projectileConfig);
+            float maxDistance = MonsterProjectileTiming.GetMaxDistance(_projectileConfig);
 
             var projectileObj = await NetworkMgr.SpawnAsync(
                 _projectileConfig.ProjectilePrefab,

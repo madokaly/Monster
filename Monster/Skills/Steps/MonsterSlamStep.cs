@@ -31,7 +31,7 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 震击步骤（点式，§16.4）：StartOffset 时刻权威端单次范围结算，特效各端本地播。
+    /// 震击步骤（点式）：StartOffset 时刻各端单次范围结算（受击方本地结算 §1.7），特效各端本地播。
     /// 组合示例：落地震击 = [Chase(0.6s 起), Slam(1.2s 起)]。
     /// </summary>
     public class MonsterSlamStep : MonsterSkillStep
@@ -48,15 +48,13 @@ namespace Game.Entities
             if (_slamConfig is null) return;
 
             // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）
-            if (!HasStateAuthority) return;
-
             Settle();
         }
 
         #region Private Methods
 
         /// <summary>
-        /// 权威端单次范围结算（共享结算管线）。
+        /// 单次范围结算（共享结算管线，受击方本地结算 §1.7）。
         /// </summary>
         private void Settle()
         {

@@ -15,26 +15,37 @@ namespace Game.Entities
         public MeleeHandler[] MeleeHandlers;
 
         [Header("Cast Window")]
-        [Tooltip("近战检测窗口时长（秒；旧制 = 开满整个施放 = 技能动画时长）")]
+        [Tooltip("前摇时长（秒，步骤起点 → 开启刀刃检测；此段只播表现不判定）")]
+        public float HitDelay;
+
+        [Tooltip("伤害窗口时长（秒，刀刃检测开启 → 关闭；需 > 0，装配校验把关）")]
         public float Window;
 
+        [Tooltip("后摇时长（秒，关闭刀刃检测 → 步骤结束；此段只播表现不判定）")]
+        public float RecoveryDuration;
+
         [Header("Damage")]
-        [Tooltip("单次挥击伤害（开窗前经 SetDamageOverride 写入，prefab 上关闭挥速缩放）")]
+        [Tooltip("单次挥击伤害（开窗时经 SetDamageOverride 写入，prefab 上关闭挥速缩放）")]
         public int Damage = 1;
 
-        public override float Duration => Window;
+        public override float Duration => HitDelay + Window + RecoveryDuration;
     }
 
     /// <summary>
-    /// 近战步骤（§16.4）：窗口开启 MeleeHandler（仅权威端），窗口结束关闭；
-    /// 命中经 MeleeHandler 的 OnMeleeHit 事件上报 → 组装 DamageData / HitData → 双总线结算。
-    /// 伤害以步骤 Config.Damage 为单一可信源（开窗前经 SetDamageOverride 写入）；
-    /// 命中过滤以组件 _hitMask 层级为准（层即规则），每目标冷却由组件自身维护。
-    /// 窗口时长 = Duration（>0 窗口式；0 时配合链内后续步骤表达，本步骤即点式开关脉冲）。
+    /// 近战步骤：三段相位 HitDelay 前摇 → Window 伤害窗口 → RecoveryDuration 后摇（时长由相位派生）。
+    /// 各端在伤害窗口上升沿按本端时钟原子开窗（伤害覆盖 + 使能检测 + 刷新挥砍基准，防跨禁用期幻影挥砍；
+    /// 动画经 AnimId 状态同步，各端时差 §1.7 偏差允许），下降沿 / 步骤退出关窗。
+    /// 命中经 MeleeHandler 的 OnMeleeHit 事件上报 → 仅结算 SA 在本端的目标（受击方本地结算 §1.7）
+    /// → 组装 DamageData / HitData → 双总线结算。
+    /// 伤害以步骤 Config.Damage 为单一可信源（开窗时经 SetDamageOverride 写入）；
+    /// 命中过滤以组件 _hitMask 层级为准（层即规则），每目标冷却由组件自身维护（各端独立）。
     /// </summary>
     public class MonsterMeleeStep : MonsterSkillStep
     {
         private readonly MonsterMeleeStepConfig _meleeConfig;
+
+        /// <summary> 本端：伤害窗口是否开启（本端时钟上升 / 下降沿检测） </summary>
+        private bool _hitWindowOpen;
 
         public MonsterMeleeStep(MonsterModel model, MonsterMeleeStepConfig config)
             : base(model, config)
@@ -51,6 +62,8 @@ namespace Game.Entities
 
         protected override void OnStepEnter(float elapsed)
         {
+            _hitWindowOpen = false;
+
             if (_meleeConfig is null) return;
             if (_meleeConfig.MeleeHandlers == null)
             {
@@ -58,31 +71,29 @@ namespace Game.Entities
                 return;
             }
 
-            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）
-            if (!HasStateAuthority) return;
+            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）；
+            // 刀刃检测不在步骤起点开启，等各端 Tick 推进到伤害窗口上升沿
+        }
 
-            // 权威端：伤害覆盖（Config 单一可信源）+ 开启刀刃检测
-            for (int i = 0; i < _meleeConfig.MeleeHandlers.Length; i++)
-            {
-                var handler = _meleeConfig.MeleeHandlers[i];
-                if (handler == null) continue;
-                handler.SetDamageOverride(Mathf.Max(1, _meleeConfig.Damage));
-                handler.enabled = true;
-            }
+        protected override void OnStepTick(float elapsed)
+        {
+            if (_meleeConfig is null) return;
+
+            // 伤害窗口门控（各端本端时钟，边沿驱动）：开窗 / 关窗各只做一次
+            float stepElapsed = elapsed - _config.StartOffset;
+            bool damageActive = MonsterMeleeTiming.IsDamageActive(_meleeConfig, stepElapsed);
+
+            if (damageActive == _hitWindowOpen) return;
+
+            if (damageActive) OpenHitWindow();
+            else CloseHitWindow();
         }
 
         protected override void OnStepExit()
         {
             if (_meleeConfig is null) return;
-            if (!HasStateAuthority) return;
 
-            SetMeleeActive(false);
-        }
-
-        protected override void OnStepAuthorityChanged()
-        {
-            // 权威易主：保守关闭组件（等下次 Enter 再开）
-            SetMeleeActive(false);
+            CloseHitWindow();
         }
 
         #region Registers
@@ -126,16 +137,20 @@ namespace Game.Entities
         {
             if (_model is null) return;
             if (_meleeConfig is null) return;
-            if (!HasStateAuthority) return;
+
+            // 受击方本地结算（§1.7）：只结算 SA 在本端的目标，其余端各自命中各自结算
+            if (!MonsterSkillDamage.IsTargetAuthoritativeHere(target.Id)) return;
 
             var damageData = new DamageData { Damage = damage, AttackerId = _model.Id, };
 
             var hitData = new HitData
             {
-                HitPoint = hitPoint, HitDirection = hitDirection, Force = force,
+                HitPoint = hitPoint,
+                HitDirection = hitDirection,
+                Force = force,
             };
 
-            // 伤害结算 + 打击反馈（经通用命令到达目标权威端）
+            // 伤害结算 + 打击反馈（目标权威端就在本端，端内直接落地）
             Msger.Send(MsgID.ApplyDamage, target.Id, damageData);
             Msger.Send(MsgID.ApplyHit, target.Id, hitData);
         }
@@ -145,20 +160,41 @@ namespace Game.Entities
         #region Private Methods
 
         /// <summary>
-        /// 开关刀刃检测组件（幂等；关闭时顺带清除伤害覆盖）
+        /// 开启刀刃检测（原子三件事：伤害覆盖 → 使能 → 刷新挥砍基准，防跨禁用期幻影挥砍）
         /// </summary>
-        private void SetMeleeActive(bool active)
+        private void OpenHitWindow()
         {
-            if (_meleeConfig is null) return;
-            if (_meleeConfig.MeleeHandlers == null) return;
+            if (_meleeConfig?.MeleeHandlers == null) return;
+
+            _hitWindowOpen = true;
 
             for (int i = 0; i < _meleeConfig.MeleeHandlers.Length; i++)
             {
                 var handler = _meleeConfig.MeleeHandlers[i];
                 if (handler == null) continue;
 
-                handler.enabled = active;
-                if (!active) handler.ClearDamageOverride();
+                handler.SetDamageOverride(Mathf.Max(1, _meleeConfig.Damage));
+                handler.enabled = true;
+                handler.ResetSwingBasis();
+            }
+        }
+
+        /// <summary>
+        /// 关闭刀刃检测（幂等；顺带清除伤害覆盖）
+        /// </summary>
+        private void CloseHitWindow()
+        {
+            _hitWindowOpen = false;
+
+            if (_meleeConfig?.MeleeHandlers == null) return;
+
+            for (int i = 0; i < _meleeConfig.MeleeHandlers.Length; i++)
+            {
+                var handler = _meleeConfig.MeleeHandlers[i];
+                if (handler == null) continue;
+
+                handler.enabled = false;
+                handler.ClearDamageOverride();
             }
         }
 
