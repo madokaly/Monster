@@ -45,13 +45,12 @@ namespace Game.Entities
 
             _bus.AddListener(MsgID.CreateMonster, OnCreateMonster);
             _bus.AddListener(MsgID.DestroyMonster, OnDestroyMonster);
+            _bus.AddListener(MsgID.DestroyZoneEntity, OnDestroyZoneEntity);
             _bus.AddListener(MsgID.MonsterSpawned, OnMonsterSpawned);
             _bus.AddListener(MsgID.MonsterDespawned, OnMonsterDespawned);
 
             _bus.AddListener(MsgID.ApplyDamage, OnApplyDamage);
             _bus.AddListener(MsgID.ApplyHit, OnApplyHit);
-
-            _bus.AddListener(MsgID.AssignMonsterAuthority, OnAssignMonsterAuthority);
         }
 
         private void RegisterProviders()
@@ -82,6 +81,18 @@ namespace Game.Entities
             if (data is EntityId entityId)
             {
                 DestroyMonster(entityId);
+                return;
+            }
+
+            Logging.Error($"MsgID.{id}: 数据类型不匹配");
+        }
+
+        private void OnDestroyZoneEntity(MsgID id, object data)
+        {
+            if (data is EntityId expStoneId)
+            {
+                if (!_monsterCtrls.ContainsKey(expStoneId)) return;
+                DestroyMonster(expStoneId);
                 return;
             }
 
@@ -144,30 +155,6 @@ namespace Game.Entities
             Logging.Error($"MsgID.{id}: 数据类型不匹配");
         }
 
-        private void OnAssignMonsterAuthority(MsgID id, object data)
-        {
-            if (data is object[] { Length: 2 } datas && datas[0] is EntityId monsterId && datas[1] is EntityId ownerId)
-            {
-                if (!_monsterCtrls.TryGetValue(monsterId, out var ctrl))
-                {
-                    // 监听顺序兜底：Spawner 在 MonsterSpawned 事件内立即发指派，
-                    // 缓存可能尚未入账（取决于各监听方的注册顺序）——直接从 Runner 解析并补缓存
-                    if (!NetworkMgr.TryFindObjectOfType(monsterId.NetId, out ctrl))
-                    {
-                        Logging.Error($"[MonsterSystem] OnAssignMonsterAuthority: 找不到目标 Monster ({monsterId})");
-                        return;
-                    }
-
-                    _monsterCtrls[monsterId] = ctrl;
-                }
-
-                ctrl.RequestAssignAuthority(ownerId);
-                return;
-            }
-
-            Logging.Error($"MsgID.{id}: 数据类型不匹配");
-        }
-
         #endregion
 
         #region Create API
@@ -206,18 +193,12 @@ namespace Game.Entities
 
         /// <summary>
         /// 销毁怪物（公开 API）。
-        /// 业务守卫：仅 MasterClient 端受理销毁请求（世界销毁决策只由 MC 发起）；
-        /// 实际 Despawn 经 MonsterCtrl.RequestDespawn 跨端路由到怪物权威端执行
-        /// （怪物权威归属附近玩家，MC 可能不是权威端——统一销毁模式见规范 §8）。
+        /// 销毁来源含权威端自身的实体级计时（冻结 TTL，§16.5），不再限定 MC——
+        /// 受理不做端守卫；实际 Despawn 经 MonsterCtrl.RequestDespawn 跨端路由到怪物权威端执行
+        /// （怪物权威归属附近玩家，发起方可能不是权威端——统一销毁模式见规范 §8）。
         /// </summary>
         public void DestroyMonster(EntityId entityId)
         {
-            if (!NetworkMgr.IsMasterClient)
-            {
-                Logging.Warning($"[MonsterSystem] DestroyMonster: 仅 MasterClient 端允许销毁怪物 ({entityId})");
-                return;
-            }
-
             if (!_monsterCtrls.TryGetValue(entityId, out var ctrl))
             {
                 Logging.Error($"[MonsterSystem] DestroyMonster: 找不到实体缓存 ({entityId})，无法销毁");

@@ -1,8 +1,11 @@
+using System;
 using System.Collections.Generic;
+using Cysharp.Threading.Tasks;
 using Framework;
 using Framework.Core;
 using Framework.Network;
 using Fusion;
+using Game.Components;
 using Game.DTOs;
 using Sirenix.OdinInspector;
 using UnityEngine;
@@ -41,8 +44,8 @@ namespace Game.Entities
         private MonsterBattleViewModuleConfig _battleViewModuleConfig;
 
         [SerializeField]
-        [BoxGroup("Modules/Authority Module", centerLabel: true), HideLabel]
-        private MonsterAuthorityModuleConfig _authorityModuleConfig;
+        [BoxGroup("Modules/Zone Authority Module", centerLabel: true), HideLabel]
+        private ZoneAuthorityModuleConfig _zoneAuthorityModuleConfig;
 
         [SerializeField]
         [BoxGroup("Modules/Skill Modules", centerLabel: true), HideLabel]
@@ -54,7 +57,7 @@ namespace Game.Entities
         private MonsterMoveModule _moveModule;
         private MonsterRenderModule _renderModule;
         private MonsterBattleViewModule _battleViewModule;
-        private MonsterAuthorityModule _authorityModule;
+        private ZoneAuthorityModule _zoneAuthorityModule;
         private readonly List<MonsterSkillChainRunner> _chainRunners = new();
 
         /// <summary> 销毁请求已发出标记（幂等：Spawner 轮询 / 多来源重复发送只转发一次） </summary>
@@ -101,7 +104,7 @@ namespace Game.Entities
             _moveModule = new MonsterMoveModule(_model, _moveModuleConfig);
             _renderModule = new MonsterRenderModule(_model, _renderModuleConfig);
             _battleViewModule = new MonsterBattleViewModule(_model, _battleViewModuleConfig);
-            _authorityModule = new MonsterAuthorityModule(_model, _authorityModuleConfig);
+            _zoneAuthorityModule = new ZoneAuthorityModule(_model, _zoneAuthorityModuleConfig);
 
             AssembleSkillChains();
 
@@ -123,7 +126,7 @@ namespace Game.Entities
             _moveModule?.Dispose();
             _renderModule?.Dispose();
             _battleViewModule?.Dispose();
-            _authorityModule?.Dispose();
+            _zoneAuthorityModule?.Dispose();
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -147,13 +150,20 @@ namespace Game.Entities
             _moveModule?.StateAuthorityChanged(hasStateAuthority);
             _renderModule?.StateAuthorityChanged(hasStateAuthority);
             _battleViewModule?.StateAuthorityChanged(hasStateAuthority);
-            _authorityModule?.StateAuthorityChanged(hasStateAuthority);
+            _zoneAuthorityModule?.StateAuthorityChanged(hasStateAuthority);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
                 _chainRunners[i]?.StateAuthorityChanged(hasStateAuthority);
             }
         }
+
+#if UNITY_EDITOR
+        private void OnDrawGizmosSelected()
+        {
+            MonsterPerceptionModule.DrawGizmos(_model, _perceptionModuleConfig, transform);
+        }
+#endif
 
         private void FixedUpdate()
         {
@@ -165,7 +175,7 @@ namespace Game.Entities
             _moveModule?.FixedUpdate(fixedDeltaTime);
             _renderModule?.FixedUpdate(fixedDeltaTime);
             _battleViewModule?.FixedUpdate(fixedDeltaTime);
-            _authorityModule?.FixedUpdate(fixedDeltaTime);
+            _zoneAuthorityModule?.FixedUpdate(fixedDeltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -183,7 +193,7 @@ namespace Game.Entities
             _moveModule?.FixedUpdateNetwork(deltaTime);
             _renderModule?.FixedUpdateNetwork(deltaTime);
             _battleViewModule?.FixedUpdateNetwork(deltaTime);
-            _authorityModule?.FixedUpdateNetwork(deltaTime);
+            _zoneAuthorityModule?.FixedUpdateNetwork(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -201,7 +211,7 @@ namespace Game.Entities
             _moveModule?.Update(deltaTime);
             _renderModule?.Update(deltaTime);
             _battleViewModule?.Update(deltaTime);
-            _authorityModule?.Update(deltaTime);
+            _zoneAuthorityModule?.Update(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -219,7 +229,7 @@ namespace Game.Entities
             _moveModule?.LateUpdate(deltaTime);
             _renderModule?.LateUpdate(deltaTime);
             _battleViewModule?.LateUpdate(deltaTime);
-            _authorityModule?.LateUpdate(deltaTime);
+            _zoneAuthorityModule?.LateUpdate(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -310,38 +320,33 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 请求：指定权威归属（写入 [Networked] DesiredAuthorityOwner，调用点需要跨端必达权威）
-        /// </summary>
-        public void RequestAssignAuthority(EntityId ownerId)
-        {
-            if (!HasStateAuthority)
-            {
-                RPC_RequestAssignAuthority(ownerId);
-                return;
-            }
-
-            if (_model is null) return;
-
-            _model.SetDesiredAuthorityOwner(ownerId);
-        }
-
-        /// <summary>
         /// 请求：销毁（统一销毁模式 §8——调用点可能在任何端；非权威端 RPC 转发，权威端执行 Despawn）。
+        /// SA=None 特权分支（§16.4 第三层）：RPC 无目标，MC 直接 Despawn（prefab 需勾选 Allow State Authority Override）。
         /// 幂等守卫：销毁轮询 / 多来源重复发送只转发一次。
         /// </summary>
         public void RequestDespawn()
         {
             if (_despawnRequested) return;
-            _despawnRequested = true;
 
             if (!HasStateAuthority)
             {
+                // SA=None 时 RPC 无目标：仅 MC 可行使无 SA Despawn 特权（§16.4 第三层）
+                if (Object.StateAuthority.IsNone)
+                {
+                    if (!NetworkMgr.IsMasterClient) return;
+                    _despawnRequested = true;
+                    if (Object == null || !Object.IsValid) return;
+                    NetworkMgr.Despawn(Object);
+                    return;
+                }
+
+                _despawnRequested = true;
                 RPC_RequestDespawn();
                 return;
             }
 
             if (Object == null || !Object.IsValid) return;
-
+            _despawnRequested = true;
             NetworkMgr.Despawn(Object);
         }
 
@@ -369,12 +374,6 @@ namespace Game.Entities
         private void RPC_RequestApplyHit(HitData damageData)
         {
             RequestApplyHit(damageData);
-        }
-
-        [Rpc(RpcSources.All, RpcTargets.StateAuthority)]
-        private void RPC_RequestAssignAuthority(EntityId ownerId)
-        {
-            RequestAssignAuthority(ownerId);
         }
 
         [Rpc(RpcSources.All, RpcTargets.StateAuthority)]
@@ -499,23 +498,53 @@ namespace Game.Entities
                     valid = false;
                 }
 
+                if (step.EndOffset < 0f)
+                {
+                    Logging.Error($"[MonsterCtrl] ValidateChain: 步骤收尾延迟为负 (stepIndex: {j}, endOffset: {step.EndOffset}) {chainLabel}");
+                    valid = false;
+                }
+
+                // 近战步骤窗口字段校验（时长由相位派生，字段级非法直接拒绝装配）
+                if (step is MonsterMeleeStepConfig meleeStep
+                    && (meleeStep.HitDelay < 0f || meleeStep.Window <= 0f || meleeStep.RecoveryDuration < 0f))
+                {
+                    Logging.Error(
+                        $"[MonsterCtrl] ValidateChain: 近战步骤窗口非法 (stepIndex: {j}, hitDelay: {meleeStep.HitDelay}, window: {meleeStep.Window}, recovery: {meleeStep.RecoveryDuration}) {chainLabel}"
+                    );
+                    valid = false;
+                }
+
+                // 召唤步骤装配校验（引用缺失运行时报错；窗口必须为正——点式语义会让召唤物立即停伤）
+                if (step is MonsterSummonStepConfig summonStep
+                    && (summonStep.SelfTransform == null || summonStep.SummonPrefab == null || summonStep.Duration <= 0f))
+                {
+                    Logging.Error(
+                        $"[MonsterCtrl] ValidateChain: 召唤步骤装配非法 (stepIndex: {j}, selfTransform 为空: {summonStep.SelfTransform == null}, summonPrefab 为空: {summonStep.SummonPrefab == null}, duration: {summonStep.Duration}) {chainLabel}"
+                    );
+                    valid = false;
+                }
+
                 if (step.StepAnimIds != null)
                 {
                     for (int k = 0; k < step.StepAnimIds.Length; k++)
                     {
                         if (step.StepAnimIds[k] >= 0) continue;
 
-                        Logging.Error($"[MonsterCtrl] ValidateChain: 步骤动画非法 (stepIndex: {j}, animId: {step.StepAnimIds[k]}) {chainLabel}");
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 步骤动画非法 (stepIndex: {j}, animId: {step.StepAnimIds[k]}) {chainLabel}"
+                        );
                         valid = false;
                     }
                 }
 
-                // 窗口重叠告警：后续步骤在前序窗口式步骤窗口内进入 → 运行器重叠守卫会提前截断前序步骤
-                if (previousStep != null && previousStep.Duration > 0f &&
-                    step.StartOffset < previousStep.StartOffset + previousStep.Duration)
+                // 窗口重叠告警（按总窗口 = 内容 + 收尾延迟）：后续步骤在前序步骤窗口内进入
+                // → 运行器重叠守卫会提前截断前序步骤（含收尾段被打断）
+                if (previousStep != null
+                    && previousStep.TotalDuration > 0f
+                    && step.StartOffset < previousStep.StartOffset + previousStep.TotalDuration)
                 {
                     Logging.Warning(
-                        $"[MonsterCtrl] ValidateChain: 步骤窗口重叠 (stepIndex: {j}, startOffset: {step.StartOffset} 落在前序窗口式步骤 [{previousStep.StartOffset}, {previousStep.StartOffset + previousStep.Duration}) 内，前序步骤将被提前截断) {chainLabel}"
+                        $"[MonsterCtrl] ValidateChain: 步骤窗口重叠 (stepIndex: {j}, startOffset: {step.StartOffset} 落在前序步骤 [{previousStep.StartOffset}, {previousStep.StartOffset + previousStep.TotalDuration}) 内，前序步骤（含收尾段）将被提前截断) {chainLabel}"
                     );
                 }
 
@@ -527,5 +556,74 @@ namespace Game.Entities
         }
 
         #endregion
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+
+        #region Debug (Test Only)
+
+        /// <summary> 测试用：分次攻击次数（模拟玩家连续命中，让受击反应 + 死亡动画完整播放） </summary>
+        private const int DEBUG_KILL_HIT_COUNT = 8;
+        /// <summary> 测试用：分次攻击间隔（秒）。受击反应节流 0.1s，稍大些让动画可读 </summary>
+        private const float DEBUG_KILL_HIT_INTERVAL = 0.15f;
+
+        /// <summary>
+        /// 测试用：模拟"被本地玩家连击致死"的标准死亡流程（Odin [Button]，Inspector 上直接显示）。
+        /// <para>走完整链路：本地玩家作为攻击者 → 分 8 次伤害让受击反应逐次播放 → HP 归零触发死亡动画 →
+        /// <c>DiedAnimTimer</c> 到期播放爆炸 + 发送 <c>MonsterDied</c> → <c>MonsterSpawnerSystem</c> 销毁 + 碎块 + 5s 补怪。</para>
+        /// <para>非权威端经 <c>RPC_RequestApplyDamage</c> 转发（§1.7）。仅 Editor / Dev build 编译。</para>
+        /// </summary>
+        [Button("Kill (Test)", ButtonSizes.Medium)]
+        public void DebugKill()
+        {
+            if (_model == null)
+            {
+                Logging.Warning("[MonsterCtrl.DebugKill] 怪物 Model 未初始化（PreInit 未执行或编辑器非 Play 模式）");
+                return;
+            }
+
+            if (_model.IsDead())
+            {
+                Logging.Info($"[MonsterCtrl.DebugKill] 怪物已死亡 (id: {Id})，跳过");
+                return;
+            }
+
+            DebugKillSequenceAsync(this.GetCancellationTokenOnDestroy()).Forget();
+        }
+
+        /// <summary>
+        /// 分次施加伤害的异步序列（模拟玩家连击致死）。
+        /// 攻击者 = 本地玩家（保证击杀归属正确）；最后一次扣剩余 HP 触发 <c>EnterDead</c> → <c>DiedAnimTimer</c>。
+        /// </summary>
+        private async UniTaskVoid DebugKillSequenceAsync(System.Threading.CancellationToken ct)
+        {
+            if (_model == null || _model.IsDead()) return;
+
+            EntityId attackerId = Svcer.Req<EntityId>(SvcID.QueryLocalPlayer);
+
+            int maxHp = _model.MaxHp;
+            int perHit = Mathf.Max(1, Mathf.CeilToInt(maxHp / (float)DEBUG_KILL_HIT_COUNT) + 1);
+
+            Logging.Info(
+                $"[MonsterCtrl.DebugKill] 模拟本地玩家连击致死 id={Id} cfgId={_model.Template.CfgId} "
+                + $"MaxHp={maxHp} → 分 {DEBUG_KILL_HIT_COUNT} 次，每次 {perHit} 伤害"
+            );
+
+            for (int i = 0; i < DEBUG_KILL_HIT_COUNT; i++)
+            {
+                if (ct.IsCancellationRequested) return;
+                if (_model == null || _model.IsDead()) return;
+
+                // 最后一段：直接扣剩余 HP，避免 overkill
+                int damage = (i == DEBUG_KILL_HIT_COUNT - 1) ? Mathf.Max(1, _model.Hp) : perHit;
+
+                RequestApplyDamage(new DamageData { Damage = damage, AttackerId = attackerId, });
+
+                await UniTask.Delay(TimeSpan.FromSeconds(DEBUG_KILL_HIT_INTERVAL), cancellationToken: ct);
+            }
+        }
+
+        #endregion
+
+#endif
     }
 }

@@ -4,6 +4,7 @@ using cfg;
 using Framework;
 using Framework.Core;
 using Fusion;
+using Game.Components;
 using Game.DTOs;
 using UnityEngine;
 using Vector3 = UnityEngine.Vector3;
@@ -39,23 +40,37 @@ namespace Game.Entities
 
     /// <summary>
     /// Monster 配置模板：Spawn 前由权威端写入，全端可读。
+    /// RegionId：所属副本区域（生成时由出生点配置解析）；FrozenDespawnDelay：冻结超时销毁时长（秒，§16.1）。
     /// </summary>
     public readonly struct MonsterTemplate : IEquatable<MonsterTemplate>, INetworkStruct
     {
         public readonly int CfgId;
+        /// <summary> 出生点 Id </summary>
         public readonly int SpawnId;
+        /// <summary> 出生点第几只 </summary>
+        public readonly int MonsterIndex;
+        /// <summary> 归属副本区域（0 = 无区域） </summary>
+        public readonly int RegionId;
+        /// <summary> 冻结超时销毁时长（秒；当前由共享常量注入，接表后移除） </summary>
+        public readonly float FrozenDespawnDelay;
 
-        public MonsterTemplate(int cfgId, int spawnId)
+        public MonsterTemplate(int cfgId, int spawnId, int monsterIndex, int regionId = 0,
+            float frozenDespawnDelay = Consts.DEFAULT_FROZEN_DESPAWN_DELAY)
         {
             CfgId = cfgId;
             SpawnId = spawnId;
+            MonsterIndex = monsterIndex;
+            RegionId = regionId;
+            FrozenDespawnDelay = frozenDespawnDelay;
         }
 
-        public bool Equals(MonsterTemplate other) => CfgId == other.CfgId && SpawnId == other.SpawnId;
+        public bool Equals(MonsterTemplate other) =>
+            CfgId == other.CfgId && SpawnId == other.SpawnId && MonsterIndex == other.MonsterIndex &&
+            RegionId == other.RegionId && FrozenDespawnDelay.Equals(other.FrozenDespawnDelay);
 
         public override bool Equals(object obj) => obj is MonsterTemplate other && Equals(other);
 
-        public override int GetHashCode() => HashCode.Combine(CfgId, SpawnId);
+        public override int GetHashCode() => HashCode.Combine(CfgId, SpawnId, MonsterIndex, RegionId, FrozenDespawnDelay);
 
         public static bool operator ==(MonsterTemplate lhs, MonsterTemplate rhs) => lhs.Equals(rhs);
 
@@ -66,9 +81,13 @@ namespace Game.Entities
     /// Monster Model 主文件：状态事实 + 直接 Setter。
     /// 战斗规则见 <see cref="MonsterModel"/>（MonsterModel.Combat.cs），技能规则见 MonsterModel.Skill.cs。
     /// </summary>
-    public partial class MonsterModel : NetworkBehaviour, IAfterSpawned, IStateAuthorityChanged
+    public partial class MonsterModel : NetworkBehaviour, IAfterSpawned, IStateAuthorityChanged,
+                                        IZoneAuthorityModel
     {
         private const int SKILL_COOLDOWN_CAPACITY = 16;
+
+        /// <summary> 参与伤害名单容量上限（掉落分派用）</summary>
+        private const int MAX_DAMAGE_DEALERS = 8;
 
         #region Networked Datas
 
@@ -131,11 +150,23 @@ namespace Game.Entities
         [Tooltip("本次施放的目标（单目标技能表现用）")]
         public EntityId CastTargetId { get; private set; }
 
+        [Networked]
+        [Tooltip("落石步骤的本次落石快照（Seq 每次施放 +1；消费方轮询取用，无变更事件）")]
+        public MonsterRockfallState RockfallState { get; private set; }
+
         // ===== 权威归属 =====
 
+        [Networked, OnChangedRender(nameof(OnHomeZoneIdChangedHandler))]
+        [Tooltip("归属区域（0 = 无区域，一等归属非错误值；生成时由 Template 初始化，SA 端采样更新）")]
+        public int HomeZoneId { get; private set; }
+
         [Networked, OnChangedRender(nameof(OnDesiredAuthorityOwnerChangedHandler))]
-        [Tooltip("期望的权威归属玩家实体身份（MonsterAuthorityModule 各端本地反应）")]
+        [Tooltip("有效权威归属（无效 = 冻结）；唯一写入者 = 实体当前 SA 端（ApplyZoneAuthority 级联）")]
         public EntityId DesiredAuthorityOwner { get; private set; }
+
+        [Networked, OnChangedRender(nameof(OnFrozenSinceTickChangedHandler))]
+        [Tooltip("冻结起表时刻（到期时刻语义：起表时按 FrozenDespawnDelay 定格到期 Tick；未运行 = 未起表）")]
+        public TickTimer FrozenSinceTick { get; private set; }
 
         // ===== 受控事实计时器（TickTimer 全端同步，易主无缝）=====
 
@@ -171,13 +202,41 @@ namespace Game.Entities
         [Networked, Capacity(SKILL_COOLDOWN_CAPACITY)]
         public NetworkArray<MonsterSkillCooldownState> SkillCooldownStates => default;
 
+        // ===== 掉落归属 =====
+
+        [Networked, Capacity(MAX_DAMAGE_DEALERS)]
+        [Tooltip("参与伤害的实体名单（掉落分派用；0 为无效哨兵，去重 + 容量上限）")]
+        public NetworkArray<EntityId> Attackers => default;
+
+        [Networked]
+        [Tooltip("最后一击攻击者（击杀归因用；随每次受击覆盖记录，名单去重不影响）")]
+        public EntityId LastAttacker { get; private set; }
+
         #endregion
 
         #region Local Datas
 
-        public CfgMonsterstats Cfg => ConfigMgr.Tables.TbMonsterstats.GetOrDefault(Template.CfgId);
+        public CfgMonsterstats Cfg
+        {
+            get
+            {
+                _cfg ??= ConfigMgr.Tables.TbMonsterstats.GetOrDefault(Template.CfgId);
+                return _cfg;
+            }
+        }
 
-        public CfgMonsterspwan SpawnCfg => ConfigMgr.Tables.TbMonsterspwan.GetOrDefault(Template.SpawnId);
+        private CfgMonsterstats _cfg;
+
+        public CfgMonsterspwan SpawnCfg
+        {
+            get
+            {
+                _spawnCfg ??= ConfigMgr.Tables.TbMonsterspwan.GetOrDefault(Template.SpawnId);
+                return _spawnCfg;
+            }
+        }
+
+        private CfgMonsterspwan _spawnCfg;
 
         /// <summary> 巡逻中心（出生点配置位置）</summary>
         public Vector3 PatrolCenter
@@ -277,16 +336,17 @@ namespace Game.Entities
         public bool IsControlled =>
             HitAnimTimer.IsRunning || StunnedAnimTimer.IsRunning || GuardBrokenAnimTimer.IsRunning;
 
+        /// <summary> 冻结超时销毁时长（秒；Template 派生） </summary>
+        public float FrozenDespawnDelay => Template.FrozenDespawnDelay;
+
         /// <summary>
         /// 行动态（派生投影，非第二份状态）：把受限事实的优先级阶梯收敛为一个具名值。
         /// AI 决策守卫、动画兵底层让路、脱战回血资格判定，统一读它。
         /// </summary>
-        public MonsterActState ActState =>
-            IsDead() ? MonsterActState.Dead
-            : IsControlled ? MonsterActState.Controlled
-            : IsCastingSkill() ? MonsterActState.Casting
-            : IsCombatExitCooldown ? MonsterActState.Disengaging
-            : MonsterActState.Free;
+        public MonsterActState ActState => IsDead() ? MonsterActState.Dead :
+            IsControlled ? MonsterActState.Controlled :
+            IsCastingSkill() ? MonsterActState.Casting :
+            IsCombatExitCooldown ? MonsterActState.Disengaging : MonsterActState.Free;
 
         /// <summary> 死亡动画时长（表派生）</summary>
         public float DeadAnimLength => GetAnimLength(DeadAnim);
@@ -352,7 +412,11 @@ namespace Game.Entities
         public event Action<int> OnCastCountChanged;
         public event Action<EntityId> OnCastTargetIdChanged;
 
+        public event Action<int> OnHomeZoneIdChanged;
+
         public event Action<EntityId> OnDesiredAuthorityOwnerChanged;
+
+        public event Action<bool> OnFrozenSinceTickChanged;
 
         public event Action<bool> OnCastingSkillTimerChanged;
         public event Action<bool> OnHitAnimTimerChanged;
@@ -368,6 +432,9 @@ namespace Game.Entities
 
         public event Action<Vector3> OnTeleportPositionPushed;
         public event Action<Quaternion> OnTeleportRotationPushed;
+
+        /// <summary> 本体旋转推送（权威端逐 tick 转向驱动，如 Beam 吐息跟踪；不落状态）</summary>
+        public event Action<Quaternion> OnBodyRotationPushed;
 
         /// <summary> 受击表现推送（一次性瞬变，权威端本地播受击 IK 用）</summary>
         public event Action<HitData> OnHitReceivedPushed;
@@ -406,12 +473,23 @@ namespace Game.Entities
             CastingChainIndex = -1;
             CastCount = 0;
             CastTargetId = default;
+
+            // 权威域事实（生成即指明归属：Template.RegionId → HomeZoneId，§16.3；
+            // 出生首帧由当时的 SA 运行选举，空区出生即冻结起表）
+            HomeZoneId = template.RegionId;
             DesiredAuthorityOwner = default;
+            FrozenSinceTick = default;
 
             // 技能冷却槽：链索引 0 是合法链，空槽哨兵统一 -1
             for (int i = 0; i < SKILL_COOLDOWN_CAPACITY; i++)
             {
                 SkillCooldownStates.Set(i, new MonsterSkillCooldownState { ChainIndex = -1, CooldownTimer = default });
+            }
+
+            // 参与伤害名单：清空（0 为无效哨兵）
+            for (int i = 0; i < MAX_DAMAGE_DEALERS; i++)
+            {
+                Attackers.Set(i, default);
             }
         }
 
@@ -510,6 +588,18 @@ namespace Game.Entities
         }
 
         /// <summary>
+        /// 设置：落石快照（权威端落石步骤选点后一次写入）。
+        /// 无变更事件——消费方（各端表现 / 遁地撞石判定）轮询 Seq 取用
+        /// （SkillCooldownStates 同款无事件写法）。
+        /// </summary>
+        public void SetRockfallState(MonsterRockfallState state)
+        {
+            if (!HasStateAuthority) return;
+
+            RockfallState = state;
+        }
+
+        /// <summary>
         /// 设置：是否曾进入过战斗（回血资格，易主不丢）
         /// </summary>
         public void SetHasEverBeenInCombat(bool hasEverBeenInCombat)
@@ -522,15 +612,26 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 设置：期望的权威归属玩家（[Networked] 事实，各端 MonsterAuthorityModule 本地反应）
+        /// 记录：参与伤害的实体（掉落分派名单；去重 + 容量守卫，仅权威端）。
+        /// 无变更事件——名单只在死亡广播时作为快照消费（SkillCooldownStates 同款无事件写法）。
+        /// 同时覆盖记录最后一击攻击者（击杀归因，名单去重早退不影响覆盖）。
         /// </summary>
-        public void SetDesiredAuthorityOwner(EntityId ownerId)
+        public void AddAttacker(EntityId attackerId)
         {
             if (!HasStateAuthority) return;
-            if (DesiredAuthorityOwner == ownerId) return;
+            if (!attackerId.IsValid) return;
 
-            DesiredAuthorityOwner = ownerId;
-            OnDesiredAuthorityOwnerChanged?.Invoke(DesiredAuthorityOwner);
+            LastAttacker = attackerId;
+
+            for (int i = 0; i < MAX_DAMAGE_DEALERS; i++)
+            {
+                var slot = Attackers.Get(i);
+                if (slot == attackerId) return; // 已记录
+                if (slot.IsValid) continue;
+
+                Attackers.Set(i, attackerId); // 写入首个空槽
+                return;
+            }
         }
 
         /// <summary>
@@ -747,6 +848,15 @@ namespace Game.Entities
         }
 
         /// <summary>
+        /// 推送：本体旋转（权威端逐 tick，如技能步骤转向跟踪；MoveModule 落地到 FollowerEntity）
+        /// </summary>
+        public void PushBodyRotation(Quaternion rotation)
+        {
+            if (!HasStateAuthority) return;
+            OnBodyRotationPushed?.Invoke(rotation);
+        }
+
+        /// <summary>
         /// 推送：受击表现（一次性瞬变，不落状态）
         /// </summary>
         public void PushHitReceived(HitData hitData)
@@ -843,10 +953,22 @@ namespace Game.Entities
             OnCastTargetIdChanged?.Invoke(CastTargetId);
         }
 
+        private void OnHomeZoneIdChangedHandler()
+        {
+            if (HasStateAuthority) return;
+            OnHomeZoneIdChanged?.Invoke(HomeZoneId);
+        }
+
         private void OnDesiredAuthorityOwnerChangedHandler()
         {
             if (HasStateAuthority) return;
             OnDesiredAuthorityOwnerChanged?.Invoke(DesiredAuthorityOwner);
+        }
+
+        private void OnFrozenSinceTickChangedHandler()
+        {
+            if (HasStateAuthority) return;
+            OnFrozenSinceTickChanged?.Invoke(FrozenSinceTick.IsRunning);
         }
 
         private void OnHitAnimTimerChangedHandler()
@@ -913,7 +1035,9 @@ namespace Game.Entities
             OnCastingSkillTimerChanged?.Invoke(CastingSkillTimer.IsRunning);
             OnCastTargetIdChanged?.Invoke(CastTargetId);
 
+            OnHomeZoneIdChanged?.Invoke(HomeZoneId);
             OnDesiredAuthorityOwnerChanged?.Invoke(DesiredAuthorityOwner);
+            OnFrozenSinceTickChanged?.Invoke(FrozenSinceTick.IsRunning);
 
             OnHitAnimTimerChanged?.Invoke(HitAnimTimer.IsRunning);
             OnStunnedAnimTimerChanged?.Invoke(StunnedAnimTimer.IsRunning);
@@ -938,6 +1062,21 @@ namespace Game.Entities
         /// 技能链是否已装配运行器（AI 选技能守卫：装配失败的链不选，防"幽灵施放"）
         /// </summary>
         public bool IsChainConfigured(int chainIndex) => _availableChainIndices.Contains(chainIndex);
+
+        /// <summary>
+        /// 参与伤害的实体名单快照（掉落分派用；按记录顺序，0 为无效哨兵截断）
+        /// </summary>
+        public IReadOnlyList<EntityId> GetAttackers()
+        {
+            var attackers = new List<EntityId>(MAX_DAMAGE_DEALERS);
+            for (int i = 0; i < MAX_DAMAGE_DEALERS; i++)
+            {
+                var slot = Attackers.Get(i);
+                if (!slot.IsValid) break;
+                attackers.Add(slot);
+            }
+            return attackers;
+        }
 
         /// <summary>
         /// 技能链数量（AI 技能池遍历用）

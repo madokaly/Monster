@@ -15,6 +15,29 @@ namespace Game.Entities
     }
 
     /// <summary>
+    /// 落石步骤写入的本次落石快照（变体专属载荷，类型名携带归属）。
+    /// 权威端选点后一次写入全端同步；消费方轮询 Seq 识别新一次落石；
+    /// ExpireTick 为陨石驻场失效时刻（遁地撞石判定用，仅权威端消费）；
+    /// BrokenMask 为已碎陨石位掩码（遁地撞石置位，陨石表现体轮询取用）。
+    /// </summary>
+    public struct MonsterRockfallState : INetworkStruct
+    {
+        /// <summary> 落石序号（每次施放 +1，0 = 从未落石；新施放掩码归零） </summary>
+        public int Seq;
+
+        /// <summary> 陨石落点（按石索引取用，未用槽位为 default） </summary>
+        public Vector3 Anchor0;
+        public Vector3 Anchor1;
+        public Vector3 Anchor2;
+
+        /// <summary> 陨石驻场失效时刻（Runner.Tick；近似取末石落地 + 驻场时长） </summary>
+        public int ExpireTick;
+
+        /// <summary> 已碎陨石位掩码（bit i = 第 i 石已碎；权威端撞石时置位，仅本 Seq 轮次内有效） </summary>
+        public byte BrokenMask;
+    }
+
+    /// <summary>
     /// Monster Model 技能领域规则：链施放 / 中断 / 冷却（§16.3 施放契约）。
     /// 公开 API 一律经主文件 Setter 落地（见 MonsterModel.cs）。
     /// </summary>

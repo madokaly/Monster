@@ -74,7 +74,7 @@ namespace Game.Entities
     /// <summary>
     /// 移动指令（权威端派生数据，不 [Networked]）。
     /// 由 MonsterAIModule 每 tick 重申写入（持续声明的意图，非一次性事件），MonsterMoveModule 监听执行。
-    /// 施法期间所有权让给技能步骤（步骤自行写 IsStopped 停 Follower 后手动位移）。
+    /// 施法期间所有权让给技能步骤（步骤停驻让位或直接下发寻路指令驱动，见 MonsterChaseStep / MonsterBurrowStep）。
     /// </summary>
     public struct MonsterMoveCommand : IEquatable<MonsterMoveCommand>
     {

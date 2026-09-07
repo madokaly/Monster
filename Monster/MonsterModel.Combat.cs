@@ -40,6 +40,9 @@ namespace Game.Entities
             // 标记进入过战斗（覆盖远程打一下就跑的场景，回血资格永久成立）
             MarkInCombat();
 
+            // 记录参与伤害的实体（掉落分派名单；击杀者同样入账）
+            AddAttacker(attacker);
+
             int finalDamage = Mathf.Max(damage - Def, 1);
 
             SetHp(Hp - finalDamage);
