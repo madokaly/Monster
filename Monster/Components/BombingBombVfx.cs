@@ -5,7 +5,7 @@ namespace Game.Components
 {
     /// <summary>
     /// 定点轰炸导弹纯表现组件（各端本地）：高空下落 → 触地爆炸（粒子 + 音效）→ 到时自毁。
-    /// 判定归 Bombing 步骤权威端结算，本组件不结算伤害（§1.5 事实与表现分流）。
+    /// 判定归 Bombing 步骤权威端结算，本组件不结算伤害（事实与表现分流）。
     /// </summary>
     public class BombingBombVfx : MonoBehaviour
     {

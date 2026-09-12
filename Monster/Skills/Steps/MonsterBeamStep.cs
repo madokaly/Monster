@@ -51,7 +51,7 @@ namespace Game.Entities
         public LayerMask ObstacleLayer;
 
         [Tooltip("受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Header("Effects")]
         [Tooltip("充能特效（预挂于怪物 prefab、默认隐藏；进入步骤播放，充能结束隐藏；摆放以 prefab 预挂为准）")]
@@ -68,10 +68,10 @@ namespace Game.Entities
 
     /// <summary>
     /// 持续追踪光束步骤：充能 → 吐息（持续伤害 + 追踪目标）。
-    /// 本体 yaw 匀角速转向目标（权威端驱动、NetworkTransform 同步代理端；Enter 停 Follower 让位），
+    /// 本体 yaw 匀角速转向目标（权威端逐帧驱动、NetworkTransform 同步代理端；Enter 停 Follower 让位），
     /// 光束水平向锁定本体前向——水平跟踪只由身体转动承担，俯仰按目标高度即时瞄准；
-    /// 各端吐息期每 tick 沿挂点 → 本方向本端 SphereCast（障碍截断）结算
-    /// （受击方本地结算 §1.7——判定几何与各端视觉光束同源，同目标按 DamageTickInterval 去重）；
+    /// 各端吐息期每帧沿挂点 → 本方向本端 SphereCast（障碍截断）结算
+    /// （受击方本地结算——判定几何与各端视觉光束同源，同目标按 DamageTickInterval 去重）；
     /// 每帧视觉更新驱动预挂特效（零实例化）：充能粒子播 / 停、
     /// 光束线端点（挂点 → 本地细射线命中 / 最远点，ObstacleLayer | DamageLayer 截断）、击中特效显隐。
     /// </summary>
@@ -136,7 +136,7 @@ namespace Game.Entities
                 ShowBeam();
             }
 
-            // 各端：吐息期每 tick 结算（受击方本地，§1.7）
+            // 各端：吐息期每 tick 结算（受击方本地）
             if (!MonsterBeamTiming.IsDamageActive(_beamConfig, stepElapsed)) return;
 
             SettleBeam();
@@ -210,7 +210,7 @@ namespace Game.Entities
                 EntityId targetId = tag.Id;
                 if (!targetId.IsValid) continue;
 
-                // 受击方本地结算（§1.7）：非本端目标不结算、不记录去重，交目标权威端自己判定
+                // 受击方本地结算：非本端目标不结算、不记录去重，交目标权威端自己判定
                 if (!MonsterSkillDamage.IsTargetAuthoritativeHere(targetId)) continue;
 
                 // 同目标 tick 间隔去重
@@ -260,7 +260,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 本体 yaw 匀角速转向目标（权威端 FUN tick）：目标向量水平投影 LookRotation +
+        /// 本体 yaw 匀角速转向目标（权威端逐帧）：目标向量水平投影 LookRotation +
         /// RotateTowards（无总角限）；无目标 / 水平距退化不转，结束与打断均不恢复朝向。
         /// 经 Model.PushBodyRotation 由 MoveModule 落地——updateRotation 开启时
         /// FollowerEntity 的 ECS 同步系统每帧把内部旋转写回 transform，
@@ -277,7 +277,7 @@ namespace Game.Entities
             if (toTarget.sqrMagnitude < 0.001f) return;
 
             Quaternion desiredRot = Quaternion.LookRotation(toTarget);
-            float maxDegrees = _beamConfig.TurnSpeed * Mathf.Max(0f, (float)_model.Runner.DeltaTime);
+            float maxDegrees = _beamConfig.TurnSpeed * Mathf.Max(0f, Time.deltaTime);
 
             _model.PushBodyRotation(Quaternion.RotateTowards(body.rotation, desiredRot, maxDegrees));
         }

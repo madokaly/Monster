@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Game.Entities
 {
     /// <summary>
-    /// 共享表现特效设置（各步骤具名槽复用：AreaHit.HitEffect / Slam.LandingEffect / EffectStep.Effect，§16.4）。
+    /// 共享表现特效设置（各步骤具名槽复用：AreaHit.HitEffect / Slam.LandingEffect / EffectStep.Effect）。
     /// 语义：槽位所在步骤的语义时刻各端本地实例化一个纯表现 prefab（不结算伤害），到时自毁；Prefab 为空 = 不播。
     /// 挂点解析：AttachPoint 优先，其次 FallbackTransform，都空由所属步骤自行兜底（如怪物自身 Transform）。
     /// </summary>

@@ -38,7 +38,7 @@ namespace Game.Entities
         public int Damage = 1;
 
         [Tooltip("命中方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Tooltip("伤害结算延迟（秒，相对步骤起点；0 = Enter 时结算）")]
         public float DamageOffset;
@@ -50,7 +50,7 @@ namespace Game.Entities
     /// 瞬发步骤：对 CastTargetId 直接结算（无弹道瞬伤，单目标；
     /// 射程筛选由 AI 决策层保证，不做二次 OverlapSphere）。
     /// Enter 各端本地播炮口特效；各端在 DamageOffset 后尝试结算（0 = Enter 即尝试），
-    /// 仅目标 SA 在本端才由本端结算（受击方本地结算 §1.7，命中方向用本端真实位置）。
+    /// 仅目标 SA 在本端才由本端结算（受击方本地结算，命中方向用本端真实位置）。
     /// </summary>
     public class MonsterInstantShotStep : MonsterSkillStep
     {

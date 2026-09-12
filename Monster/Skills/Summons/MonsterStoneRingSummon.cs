@@ -39,7 +39,7 @@ namespace Game.Components
     /// 升起 = 逐石 raycast 贴地 + 全圆冲击；升起后至 Break 前环带驻场轮询（连续带、每圈每目标一次、
     /// 跳躲高度过滤——旧版 trigger 驻场语义的轮询等价实现，零 collider）；
     /// Break = 全圆（无高度过滤）+ 爆炸特效 + 延迟自毁。
-    /// 判定为受击方本地结算（§1.7 目标权威端）；贴地 raycast 仅运行时（预演置于召唤物根高度，§18.6.2）。
+    /// 判定为受击方本地结算（目标权威端）；贴地 raycast 仅运行时（预演置于召唤物根高度）。
     /// </summary>
     public class MonsterStoneRingSummon : MonsterSummonBehaviour
     {
@@ -310,7 +310,7 @@ namespace Game.Components
         }
 
         /// <summary>
-        /// 单环预演采样：升起前置于埋藏原始位，升起后置于召唤物根高度（预演禁 raycast，§18.6.2）。
+        /// 单环预演采样：升起前置于埋藏原始位，升起后置于召唤物根高度（预演禁 raycast）。
         /// </summary>
         private void SampleRing(MonsterStoneRingConfig ring, float localTime)
         {

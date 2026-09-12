@@ -44,8 +44,8 @@ namespace Game.Entities
         private MonsterBattleViewModuleConfig _battleViewModuleConfig;
 
         [SerializeField]
-        [BoxGroup("Modules/Zone Authority Module", centerLabel: true), HideLabel]
-        private ZoneAuthorityModuleConfig _zoneAuthorityModuleConfig;
+        [BoxGroup("Modules/Simulation Authority Module", centerLabel: true), HideLabel]
+        private SimulationAuthorityModuleConfig _simulationAuthorityModuleConfig;
 
         [SerializeField]
         [BoxGroup("Modules/Skill Modules", centerLabel: true), HideLabel]
@@ -57,7 +57,7 @@ namespace Game.Entities
         private MonsterMoveModule _moveModule;
         private MonsterRenderModule _renderModule;
         private MonsterBattleViewModule _battleViewModule;
-        private ZoneAuthorityModule _zoneAuthorityModule;
+        private SimulationAuthorityModule _simulationAuthorityModule;
         private readonly List<MonsterSkillChainRunner> _chainRunners = new();
 
         /// <summary> 销毁请求已发出标记（幂等：Spawner 轮询 / 多来源重复发送只转发一次） </summary>
@@ -69,8 +69,6 @@ namespace Game.Entities
         /// <summary> 怪物配置 Id </summary>
         public int CfgId => _model != null ? _model.Template.CfgId : 0;
 
-        /// <summary> 出生点 SpawnId </summary>
-        public int SpawnId => _model != null ? _model.Template.SpawnId : 0;
 
         #region Lifecycle
 
@@ -104,15 +102,15 @@ namespace Game.Entities
             _moveModule = new MonsterMoveModule(_model, _moveModuleConfig);
             _renderModule = new MonsterRenderModule(_model, _renderModuleConfig);
             _battleViewModule = new MonsterBattleViewModule(_model, _battleViewModuleConfig);
-            _zoneAuthorityModule = new ZoneAuthorityModule(_model, _zoneAuthorityModuleConfig);
+            _simulationAuthorityModule = new MonsterSimulationAuthorityModule(_model, _simulationAuthorityModuleConfig);
 
             AssembleSkillChains();
 
             // 3. 注册到实体中心
             EntityRegistry.Register(Id, _model.Template);
 
-            // 4. 末尾发送生成完成消息
-            Msger.Send(MsgID.MonsterSpawned, Id, SpawnId);
+            // 4. 末尾发送生成完成消息（载荷带 Template：出生点 / 遭遇归属 / 槽位索引自包含，票 20）
+            Msger.Send(MsgID.MonsterSpawned, Id, _model.Template);
 
             // 5. 末尾 StateAuthorityChanged 刷新权威状态
             StateAuthorityChanged();
@@ -126,7 +124,7 @@ namespace Game.Entities
             _moveModule?.Dispose();
             _renderModule?.Dispose();
             _battleViewModule?.Dispose();
-            _zoneAuthorityModule?.Dispose();
+            _simulationAuthorityModule?.Dispose();
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -150,7 +148,7 @@ namespace Game.Entities
             _moveModule?.StateAuthorityChanged(hasStateAuthority);
             _renderModule?.StateAuthorityChanged(hasStateAuthority);
             _battleViewModule?.StateAuthorityChanged(hasStateAuthority);
-            _zoneAuthorityModule?.StateAuthorityChanged(hasStateAuthority);
+            _simulationAuthorityModule?.StateAuthorityChanged(hasStateAuthority);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -175,7 +173,7 @@ namespace Game.Entities
             _moveModule?.FixedUpdate(fixedDeltaTime);
             _renderModule?.FixedUpdate(fixedDeltaTime);
             _battleViewModule?.FixedUpdate(fixedDeltaTime);
-            _zoneAuthorityModule?.FixedUpdate(fixedDeltaTime);
+            _simulationAuthorityModule?.FixedUpdate(fixedDeltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -193,7 +191,7 @@ namespace Game.Entities
             _moveModule?.FixedUpdateNetwork(deltaTime);
             _renderModule?.FixedUpdateNetwork(deltaTime);
             _battleViewModule?.FixedUpdateNetwork(deltaTime);
-            _zoneAuthorityModule?.FixedUpdateNetwork(deltaTime);
+            _simulationAuthorityModule?.FixedUpdateNetwork(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -211,7 +209,7 @@ namespace Game.Entities
             _moveModule?.Update(deltaTime);
             _renderModule?.Update(deltaTime);
             _battleViewModule?.Update(deltaTime);
-            _zoneAuthorityModule?.Update(deltaTime);
+            _simulationAuthorityModule?.Update(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -229,7 +227,7 @@ namespace Game.Entities
             _moveModule?.LateUpdate(deltaTime);
             _renderModule?.LateUpdate(deltaTime);
             _battleViewModule?.LateUpdate(deltaTime);
-            _zoneAuthorityModule?.LateUpdate(deltaTime);
+            _simulationAuthorityModule?.LateUpdate(deltaTime);
 
             for (int i = 0; i < _chainRunners.Count; i++)
             {
@@ -266,6 +264,15 @@ namespace Game.Entities
             return _model.IsDead();
         }
 
+        /// <summary>
+        /// 查询：配置模板（归属遭遇与槽位索引在 Template 内；存活事实查询用）
+        /// </summary>
+        public MonsterTemplate QueryTemplate()
+        {
+            if (_model is null) return default;
+            return _model.Template;
+        }
+
         #endregion
 
         #region Command API
@@ -298,9 +305,7 @@ namespace Game.Entities
                 return;
             }
 
-            if (_model is null) return;
-
-            _model.TakeDamage(damageData.Damage, damageData.AttackerId);
+            _model?.TakeDamage(damageData);
         }
 
         /// <summary>
@@ -394,6 +399,7 @@ namespace Game.Entities
         private void AssembleSkillChains()
         {
             var availableChainIndices = new HashSet<int>();
+            bool hasSpawnOnceChain = false;
 
             if (_skillChains == null)
             {
@@ -410,6 +416,18 @@ namespace Game.Entities
                         $"[MonsterCtrl] AssembleSkillChains: 链配置为 null (chainIndex: {i}, monster: {_model.Template.CfgId})"
                     );
                     continue;
+                }
+
+                if (chain.CastTrigger == MonsterSkillCastTrigger.SpawnOnce)
+                {
+                    if (hasSpawnOnceChain)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] AssembleSkillChains: SpawnOnce 链重复，每只怪物最多一条 (chainIndex: {i}, monster: {_model.Template.CfgId})"
+                        );
+                        continue;
+                    }
+                    hasSpawnOnceChain = true;
                 }
 
                 if (!ValidateChain(i, chain)) continue;
@@ -446,6 +464,15 @@ namespace Game.Entities
             if (chain.AttackDistance < 0f)
             {
                 Logging.Error($"[MonsterCtrl] ValidateChain: 射程非法 {chain.AttackDistance} {chainLabel}");
+                valid = false;
+            }
+
+            if (chain.CastTrigger == MonsterSkillCastTrigger.SpawnOnce
+                && (chain.Weight != 0 || chain.CooldownTime != 0f || chain.AttackDistance != 0f))
+            {
+                Logging.Error(
+                    $"[MonsterCtrl] ValidateChain: SpawnOnce 链必须不参与 AI 数值（weight: {chain.Weight}, cooldown: {chain.CooldownTime}, attackDistance: {chain.AttackDistance}） {chainLabel}"
+                );
                 valid = false;
             }
 
@@ -500,7 +527,9 @@ namespace Game.Entities
 
                 if (step.EndOffset < 0f)
                 {
-                    Logging.Error($"[MonsterCtrl] ValidateChain: 步骤收尾延迟为负 (stepIndex: {j}, endOffset: {step.EndOffset}) {chainLabel}");
+                    Logging.Error(
+                        $"[MonsterCtrl] ValidateChain: 步骤收尾延迟为负 (stepIndex: {j}, endOffset: {step.EndOffset}) {chainLabel}"
+                    );
                     valid = false;
                 }
 
@@ -514,14 +543,179 @@ namespace Game.Entities
                     valid = false;
                 }
 
+                // 瞄准步骤装配校验（本体引用 / 窗口 / 转速非法直接拒绝装配）
+                if (step is MonsterAimStepConfig aimStep
+                    && (aimStep.Body == null || aimStep.Duration <= 0f || aimStep.TurnSpeed <= 0f))
+                {
+                    Logging.Error(
+                        $"[MonsterCtrl] ValidateChain: 瞄准步骤装配非法 (stepIndex: {j}, body 为空: {aimStep.Body == null}, duration: {aimStep.Duration}, turnSpeed: {aimStep.TurnSpeed}) {chainLabel}"
+                    );
+                    valid = false;
+                }
+
+                // 弹道步骤装配校验（引用 / 飞行与判定参数非法直接拒绝装配）
+                if (step is MonsterProjectileStepConfig projectileStep)
+                {
+                    bool projectileInvalid = projectileStep.SelfTransform == null
+                                             || projectileStep.ProjectilePrefab == null
+                                             || projectileStep.ProjectilePrefab.GetComponent<MonsterProjectile>() == null
+                                             || projectileStep.ProjectileSpeed <= 0f
+                                             || projectileStep.MaxDistance <= 0f
+                                             || projectileStep.Damage <= 0
+                                             || projectileStep.DamageLayer == 0
+                                             || projectileStep.HitRadius <= 0f
+                                             || projectileStep.HitHeight <= 0f
+                                             || projectileStep.HitDespawnDelay < 0f;
+                    if (projectileInvalid)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 弹道步骤装配非法 (stepIndex: {j}, "
+                            + $"selfTransform 为空: {projectileStep.SelfTransform == null}, "
+                            + $"projectilePrefab 为空: {projectileStep.ProjectilePrefab == null}, "
+                            + $"projectileSpeed: {projectileStep.ProjectileSpeed}, "
+                            + $"maxDistance: {projectileStep.MaxDistance}, "
+                            + $"damage: {projectileStep.Damage}, "
+                            + $"damageLayer: {projectileStep.DamageLayer.value}, "
+                            + $"hitRadius: {projectileStep.HitRadius}, "
+                            + $"hitHeight: {projectileStep.HitHeight}, "
+                            + $"hitDespawnDelay: {projectileStep.HitDespawnDelay}) {chainLabel}"
+                        );
+                        valid = false;
+                    }
+                }
+
+                // 汇聚水球步骤装配校验（引用 / 阶段时序 / 特效子节点 / 判定参数非法直接拒绝装配）
+                if (step is MonsterWaterBallStepConfig waterBallStep)
+                {
+                    bool waterBallInvalid = waterBallStep.Body == null
+                                            || waterBallStep.EffectPrefab == null
+                                            || waterBallStep.EffectPrefab.transform.Find(
+                                                MonsterWaterBallTiming.FIRE_SMOKE_CHILD_NAME
+                                            )
+                                            == null
+                                            || waterBallStep.EffectPrefab.transform.Find(
+                                                MonsterWaterBallTiming.WATER_BALL_CHILD_NAME
+                                            )
+                                            == null
+                                            || waterBallStep.ChargeDuration <= 0f
+                                            || waterBallStep.ThrowDuration <= 0f
+                                            || waterBallStep.FinalScaleMultiplier <= 0f
+                                            || waterBallStep.TurnSpeed <= 0f
+                                            || waterBallStep.FallbackThrowDistance <= 0f
+                                            || waterBallStep.ArcHeight < 0f
+                                            || waterBallStep.Damage <= 0
+                                            || waterBallStep.Radius <= 0f
+                                            || waterBallStep.MaxAttackHeight < 0f
+                                            || waterBallStep.InterruptDamageThreshold < 0
+                                            || (waterBallStep.InterruptDamageThreshold > 0
+                                                && waterBallStep.InterruptAnimId <= 0);
+                    if (waterBallInvalid)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 汇聚水球步骤装配非法 (stepIndex: {j}, "
+                            + $"body 为空: {waterBallStep.Body == null}, "
+                            + $"effectPrefab 为空: {waterBallStep.EffectPrefab == null}, "
+                            + $"chargeDuration: {waterBallStep.ChargeDuration}, "
+                            + $"throwDuration: {waterBallStep.ThrowDuration}, "
+                            + $"finalScaleMultiplier: {waterBallStep.FinalScaleMultiplier}, "
+                            + $"radius: {waterBallStep.Radius}, "
+                            + $"interruptDamageThreshold: {waterBallStep.InterruptDamageThreshold}, "
+                            + $"interruptAnimId: {waterBallStep.InterruptAnimId}) {chainLabel}"
+                        );
+                        valid = false;
+                    }
+                }
+
+                // 定向冲撞步骤装配校验（引用 / 阶段窗口 / 阶段特效非法直接拒绝装配）
+                if (step is MonsterChargeCrashStepConfig chargeStep)
+                {
+                    bool chargeInvalid = chargeStep.Body == null
+                                         || chargeStep.CollidersToTrigger is not { Length: > 0 }
+                                         || chargeStep.WarningDuration < 0f
+                                         || chargeStep.ChargeDuration <= 0f
+                                         || chargeStep.ChargeDistance <= 0f
+                                         || (chargeStep.WarningDuration > 0f
+                                             && chargeStep.WarningEffect?.Prefab == null)
+                                         || chargeStep.ChargeEffect?.Prefab == null
+                                         || (chargeStep.ContactDamage > 0
+                                             && (chargeStep.ContactHitRadius <= 0f
+                                                 || chargeStep.ContactHitHeight <= 0f));
+                    if (chargeInvalid)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 定向冲撞步骤装配非法 (stepIndex: {j}, "
+                            + $"body 为空: {chargeStep.Body == null}, "
+                            + $"colliders 为空: {chargeStep.CollidersToTrigger is not { Length: > 0 }}, "
+                            + $"warningDuration: {chargeStep.WarningDuration}, "
+                            + $"chargeDuration: {chargeStep.ChargeDuration}, "
+                            + $"chargeDistance: {chargeStep.ChargeDistance}, "
+                            + $"warningEffect 为空: {chargeStep.WarningEffect?.Prefab == null}, "
+                            + $"chargeEffect 为空: {chargeStep.ChargeEffect?.Prefab == null}, "
+                            + $"contactHitRadius: {chargeStep.ContactHitRadius}, "
+                            + $"contactHitHeight: {chargeStep.ContactHitHeight}) {chainLabel}"
+                        );
+                        valid = false;
+                    }
+                }
+
                 // 召唤步骤装配校验（引用缺失运行时报错；窗口必须为正——点式语义会让召唤物立即停伤）
                 if (step is MonsterSummonStepConfig summonStep
-                    && (summonStep.SelfTransform == null || summonStep.SummonPrefab == null || summonStep.Duration <= 0f))
+                    && (summonStep.SelfTransform == null
+                        || summonStep.SummonPrefab == null
+                        || summonStep.Duration <= 0f))
                 {
                     Logging.Error(
                         $"[MonsterCtrl] ValidateChain: 召唤步骤装配非法 (stepIndex: {j}, selfTransform 为空: {summonStep.SelfTransform == null}, summonPrefab 为空: {summonStep.SummonPrefab == null}, duration: {summonStep.Duration}) {chainLabel}"
                     );
                     valid = false;
+                }
+
+                // 登场隐藏步骤装配校验（视觉 / 碰撞引用缺失会让登场保护失效）
+                if (step is MonsterEntranceConcealStepConfig entranceConcealStep)
+                {
+                    bool bodyRotationInvalid = !float.IsFinite(entranceConcealStep.BodyRotationEuler.x)
+                                               || !float.IsFinite(entranceConcealStep.BodyRotationEuler.y)
+                                               || !float.IsFinite(entranceConcealStep.BodyRotationEuler.z);
+                    bool entranceConcealInvalid = entranceConcealStep.VisualRoot == null
+                                                  || entranceConcealStep.CollidersToTrigger is not { Length: > 0 }
+                                                  || entranceConcealStep.ConcealDuration <= 0f
+                                                  || bodyRotationInvalid
+                                                  || (entranceConcealStep.WarningEffect?.Prefab != null
+                                                      && entranceConcealStep.SelfTransform == null);
+                    if (entranceConcealInvalid)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 登场隐藏步骤装配非法 (stepIndex: {j}, visualRoot 为空: {entranceConcealStep.VisualRoot == null}, colliders 为空: {entranceConcealStep.CollidersToTrigger is not { Length: > 0 }}, concealDuration: {entranceConcealStep.ConcealDuration}, bodyRotationEuler: {entranceConcealStep.BodyRotationEuler}, warningSelfTransform 为空: {entranceConcealStep.WarningEffect?.Prefab != null && entranceConcealStep.SelfTransform == null}) {chainLabel}"
+                        );
+                        valid = false;
+                    }
+                }
+
+                // 登场下落步骤装配校验（引用 / 时序 / 伤害半径非法直接拒绝装配）
+                if (step is MonsterEntranceDescendStepConfig entranceDescendStep)
+                {
+                    bool entranceDescendInvalid = entranceDescendStep.SelfTransform == null
+                                                  || entranceDescendStep.VisualRoot == null
+                                                  || entranceDescendStep.CollidersToTrigger is not { Length: > 0 }
+                                                  || entranceDescendStep.DescendHeight <= 0f
+                                                  || entranceDescendStep.DescendDuration <= 0f
+                                                  || entranceDescendStep.LandingRecoveryDuration < 0f
+                                                  || (entranceDescendStep.Damage > 0
+                                                      && entranceDescendStep.Radius <= 0f);
+                    if (entranceDescendInvalid)
+                    {
+                        Logging.Error(
+                            $"[MonsterCtrl] ValidateChain: 登场下落步骤装配非法 (stepIndex: {j}, "
+                            + $"selfTransform 为空: {entranceDescendStep.SelfTransform == null}, "
+                            + $"visualRoot 为空: {entranceDescendStep.VisualRoot == null}, "
+                            + $"colliders 为空: {entranceDescendStep.CollidersToTrigger is not { Length: > 0 }}, "
+                            + $"descendHeight: {entranceDescendStep.DescendHeight}, "
+                            + $"descendDuration: {entranceDescendStep.DescendDuration}, "
+                            + $"landingRecoveryDuration: {entranceDescendStep.LandingRecoveryDuration}, "
+                            + $"radius: {entranceDescendStep.Radius}) {chainLabel}"
+                        );
+                        valid = false;
+                    }
                 }
 
                 if (step.StepAnimIds != null)
@@ -590,6 +784,12 @@ namespace Game.Entities
             DebugKillSequenceAsync(this.GetCancellationTokenOnDestroy()).Forget();
         }
 
+        [Button("Damage")]
+        public void Debug_Damage(int damage)
+        {
+            RequestApplyDamage(new DamageData { Damage = damage, AttackerId = Svcer.Req<EntityId>(SvcID.QueryLocalPlayer) });
+        }
+
         /// <summary>
         /// 分次施加伤害的异步序列（模拟玩家连击致死）。
         /// 攻击者 = 本地玩家（保证击杀归属正确）；最后一次扣剩余 HP 触发 <c>EnterDead</c> → <c>DiedAnimTimer</c>。
@@ -616,7 +816,7 @@ namespace Game.Entities
                 // 最后一段：直接扣剩余 HP，避免 overkill
                 int damage = (i == DEBUG_KILL_HIT_COUNT - 1) ? Mathf.Max(1, _model.Hp) : perHit;
 
-                RequestApplyDamage(new DamageData { Damage = damage, AttackerId = attackerId, });
+                RequestApplyDamage(new DamageData { Damage = damage, AttackerId = attackerId });
 
                 await UniTask.Delay(TimeSpan.FromSeconds(DEBUG_KILL_HIT_INTERVAL), cancellationToken: ct);
             }

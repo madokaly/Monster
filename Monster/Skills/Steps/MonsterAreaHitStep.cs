@@ -26,7 +26,7 @@ namespace Game.Entities
         public float MaxAttackHeight;
 
         [Tooltip("受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Tooltip("每次伤害最大目标数（0 = 无限制）")]
         public int MaxTargets;
@@ -38,7 +38,7 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 范围结算步骤：自圆心 OverlapSphere 结算（共享结算管线，受击方本地结算 §1.7）。
+    /// 范围结算步骤：自圆心 OverlapSphere 结算（共享结算管线，受击方本地结算）。
     /// 窗口式（Window > 0）：窗口内每 tick 检测，同目标窗口内一次（本端去重集）；
     /// 点式（Window = 0）：Enter 时刻一次性结算（即 Combo 段窗口与 PulseArea 时间点的共同原子）。
     /// 各端本端时钟推进；无本地表现。
@@ -60,7 +60,7 @@ namespace Game.Entities
         {
             if (_areaConfig is null) return;
 
-            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）
+            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放
             _hitTargets.Clear();
 
             if (_areaConfig.Window > 0f) return;

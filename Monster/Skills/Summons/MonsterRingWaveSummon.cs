@@ -10,7 +10,7 @@ namespace Game.Components
     /// 判定为受击方本地结算 + 扫掠体环带——每次结算覆盖 [上次内径, 本次外径]，
     /// 任何轮询步长下不漏目标（内径推进与去重集吸收重叠区重复命中）；
     /// 圆心冻结出生点（施放期怪物被 AI 门控静止，语义等价跟随）。
-    /// 时序公式内聚本类，预演经 SampleTimeline / GetDamageWindows 共用（§18.6.2 单一计算入口）。
+    /// 时序公式内聚本类，预演经 SampleTimeline / GetDamageWindows 共用（单一计算入口）。
     /// </summary>
     public class MonsterRingWaveSummon : MonsterSummonBehaviour
     {
@@ -76,6 +76,10 @@ namespace Game.Components
         private Vector3 _effectRotation = Vector3.zero;
 
         [SerializeField]
+        [Tooltip("环特效最终世界缩放（不随施放者模型缩放；判定为世界半径，表现对齐判定）")]
+        private Vector3 _effectScale = Vector3.one;
+
+        [SerializeField]
         [Tooltip("环特效存活时长（秒，<=0 兜底 3s）")]
         private float _effectLifetime = 3f;
 
@@ -93,11 +97,10 @@ namespace Game.Components
 
         private float EffectLifetime => _effectLifetime > 0f ? _effectLifetime : 3f;
 
-        public override float TimelineDuration =>
-            _chargeTime
-            + _pulseCount * _expandDuration
-            + Mathf.Max(0, _pulseCount - 1) * _pulseInterval
-            + EffectLifetime;
+        public override float TimelineDuration => _chargeTime
+                                                  + _pulseCount * _expandDuration
+                                                  + Mathf.Max(0, _pulseCount - 1) * _pulseInterval
+                                                  + EffectLifetime;
 
         #region Runtime Timeline
 
@@ -174,9 +177,7 @@ namespace Game.Components
         {
             float t = Mathf.Clamp01(progress);
             outerRadius = _maxRadius * t;
-            innerRadius = t <= _discPhaseRatio
-                ? 0f
-                : Mathf.Max(0f, outerRadius - _thickness);
+            innerRadius = t <= _discPhaseRatio ? 0f : Mathf.Max(0f, outerRadius - _thickness);
         }
 
         /// <summary>
@@ -212,12 +213,31 @@ namespace Game.Components
         {
             if (_ringEffectPrefab == null) return;
 
+            var effect = InstantiatePulseEffect();
+            Destroy(effect, Mathf.Max(0.1f, EffectLifetime));
+        }
+
+        /// <summary>
+        /// 实例化波特效：世界位姿，挂召唤物下随其统一回收；按轴补偿父级缩放
+        /// （预演克隆可能带施放者模型缩放），保证最终世界缩放恒为 _effectScale。
+        /// 运行时与预演共用同一实例化入口，保证两端表现一致。
+        /// </summary>
+        private GameObject InstantiatePulseEffect()
+        {
             var effect = Instantiate(
                 _ringEffectPrefab,
                 transform.position + transform.rotation * _effectOffset,
                 transform.rotation * Quaternion.Euler(_effectRotation)
             );
-            Destroy(effect, Mathf.Max(0.1f, EffectLifetime));
+            effect.transform.SetParent(transform, true);
+
+            Vector3 lossy = transform.lossyScale;
+            effect.transform.localScale = new Vector3(
+                _effectScale.x / lossy.x,
+                _effectScale.y / lossy.y,
+                _effectScale.z / lossy.z
+            );
+            return effect;
         }
 
         #endregion
@@ -231,7 +251,7 @@ namespace Game.Components
             // 每次采样重建（表现 = 时间纯函数）：先清上一采样实例，再按波起点年龄实例化
             for (int i = _previewEffects.Count - 1; i >= 0; i--)
             {
-                if (_previewEffects[i] != null) Destroy(_previewEffects[i]);
+                DestroyEffect(_previewEffects[i]);
             }
             _previewEffects.Clear();
 
@@ -240,10 +260,7 @@ namespace Game.Components
                 float age = localTime - GetPulseStart(i);
                 if (age < 0f || age > EffectLifetime) continue;
 
-                var effect = Instantiate(_ringEffectPrefab, transform);
-                effect.transform.localPosition = _effectOffset;
-                effect.transform.localRotation = Quaternion.Euler(_effectRotation);
-                effect.transform.localScale = _ringEffectPrefab.transform.localScale;
+                var effect = InstantiatePulseEffect();
                 _previewEffects.Add(effect);
 
                 SimulateVfx(effect, age);
@@ -260,29 +277,33 @@ namespace Game.Components
                 if (localTime >= pulseStart && localTime < pulseEnd)
                 {
                     EvaluateRadii((localTime - pulseStart) / _expandDuration, out float outer, out float inner);
-                    results.Add(new MonsterSummonDamageWindow
-                    {
-                        Shape = MonsterSummonDamageShape.Annulus,
-                        Phase = MonsterSummonWindowPhase.Active,
-                        InnerRadius = inner,
-                        OuterRadius = outer,
-                        MaxAttackHeight = _maxAttackHeight,
-                        Damage = _damage,
-                        Label = $"伤害波 {i + 1}/{_pulseCount} · {inner:0.0}–{outer:0.0}m · {_damage}",
-                    });
+                    results.Add(
+                        new MonsterSummonDamageWindow
+                        {
+                            Shape = MonsterSummonDamageShape.Annulus,
+                            Phase = MonsterSummonWindowPhase.Active,
+                            InnerRadius = inner,
+                            OuterRadius = outer,
+                            MaxAttackHeight = _maxAttackHeight,
+                            Damage = _damage,
+                            Label = $"伤害波 {i + 1}/{_pulseCount} · {inner:0.0}–{outer:0.0}m · {_damage}",
+                        }
+                    );
                 }
                 else if (localTime < pulseStart)
                 {
-                    results.Add(new MonsterSummonDamageWindow
-                    {
-                        Shape = MonsterSummonDamageShape.Annulus,
-                        Phase = MonsterSummonWindowPhase.Upcoming,
-                        InnerRadius = 0f,
-                        OuterRadius = Mathf.Max(0.5f, _thickness),
-                        MaxAttackHeight = _maxAttackHeight,
-                        Damage = _damage,
-                        Label = $"待发波 {i + 1}/{_pulseCount} · {pulseStart - localTime:0.00}s 后",
-                    });
+                    results.Add(
+                        new MonsterSummonDamageWindow
+                        {
+                            Shape = MonsterSummonDamageShape.Annulus,
+                            Phase = MonsterSummonWindowPhase.Upcoming,
+                            InnerRadius = 0f,
+                            OuterRadius = Mathf.Max(0.5f, _thickness),
+                            MaxAttackHeight = _maxAttackHeight,
+                            Damage = _damage,
+                            Label = $"待发波 {i + 1}/{_pulseCount} · {pulseStart - localTime:0.00}s 后",
+                        }
+                    );
                 }
             }
         }

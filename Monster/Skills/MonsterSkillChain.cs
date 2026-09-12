@@ -4,8 +4,15 @@ using UnityEngine;
 
 namespace Game.Entities
 {
+    /// <summary>技能链的 AI 触发方式。</summary>
+    public enum MonsterSkillCastTrigger
+    {
+        AiWeighted = 0,
+        SpawnOnce = 1,
+    }
+
     /// <summary>
-    /// 怪物技能链（Ctrl 上序列化的一条可施放技能；技能数据唯一权威，§16.1 / §16.2）。
+    /// 怪物技能链（Ctrl 上序列化的一条可施放技能；技能数据唯一权威）。
     /// 链 = 链级字段（显示名 / 权重 / 冷却 / 射程）+ 顺序步骤列表（纯时间线，无分支）。
     /// </summary>
     [Serializable]
@@ -14,7 +21,10 @@ namespace Game.Entities
         [Tooltip("显示名（调试 / 日志用）")]
         public string DisplayName;
 
-        [Tooltip("AI 权重（0 = 不进技能池）")]
+        [Tooltip("触发方式：AiWeighted = 进入 AI 权重池；SpawnOnce = 生成后权威端优先施放一次")]
+        public MonsterSkillCastTrigger CastTrigger = MonsterSkillCastTrigger.AiWeighted;
+
+        [Tooltip("AI 权重（0 = 不进技能池；SpawnOnce 链必须为 0)")]
         public int Weight = 1;
 
         [Tooltip("链冷却（秒）")]
@@ -42,7 +52,7 @@ namespace Game.Entities
 
         /// <summary>
         /// 链总时长（秒）：派生 max(StartOffset + TotalDuration)（含步骤收尾延迟），
-        /// 无显式字段（§1.1 单一可信源，避免双源不同步）。
+        /// 无显式字段（单一可信源，避免双源不同步）。
         /// </summary>
         public float CastDuration
         {

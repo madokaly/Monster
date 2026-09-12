@@ -187,8 +187,8 @@ namespace Game.Entities
             // 各端本地播放爆炸；全端本地广播 Monster_Died（各端 Spawner 实例各自收到本端广播，MC 实例执行回收与碎骸掉落）
             PlayDeathExplosion();
 
-            // 死亡位置 / spawnId / 参与伤害名单 / 最后一击者随载荷（怪物即将被回收销毁，接收方无法事后查询；
-            // §1.5 载荷最小化——位置与身份名单是接收方无法自派生的数据，掉落系统订阅此消息）
+            // 死亡位置 / spawnId / 参与伤害归属名单 / 最后一击者随载荷（怪物即将被回收销毁，接收方无法事后查询；
+            // 载荷最小化——位置与身份名单是接收方无法自派生的数据，掉落系统订阅此消息）
             var deathTransform = _config.Rendering != null ? _config.Rendering.transform : null;
             Msger.Send(
                 MsgID.MonsterDied,
@@ -197,7 +197,7 @@ namespace Game.Entities
                 deathTransform != null ? deathTransform.position : Vector3.zero,
                 deathTransform != null ? deathTransform.rotation : Quaternion.identity,
                 _model.GetAttackers(),
-                _model.LastAttacker
+                _model.LastPlayerAttacker
             );
         }
 

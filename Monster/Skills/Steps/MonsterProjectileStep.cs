@@ -1,10 +1,6 @@
 using System;
 using System.Collections.Generic;
-using Cysharp.Threading.Tasks;
-using Framework;
 using Framework.Core;
-using Framework.Network;
-using Fusion;
 using Game.Components;
 using UnityEngine;
 
@@ -17,7 +13,7 @@ namespace Game.Entities
         [Tooltip("发射原点（怪物自身 Transform）")]
         public Transform SelfTransform;
 
-        [Tooltip("弹道预制体（网络子实体·简易形态，挂 MonsterProjectile）")]
+        [Tooltip("弹道预制体（本地简易子实体，挂 MonsterProjectile）")]
         public GameObject ProjectilePrefab;
 
         [Tooltip("发射位置偏移（相对怪物朝向）")]
@@ -33,26 +29,42 @@ namespace Game.Entities
         [Tooltip("弹道命中伤害")]
         public int Damage = 1;
 
+        [Header("Projectile Sound")]
+        [Tooltip("弹道飞行音效路径数组（随机其一，各端本地播，音源跟随本次生成的弹道；空 = 不播）")]
+        public string[] ProjectileSounds;
+
         [Header("Detection")]
-        [Tooltip("伤害结算层（弹道命中判定层，对层内目标发 ApplyDamage；0 = 不过滤）")]
+        [Tooltip("伤害结算层（本端弹道命中判定层；仅目标权威端发送 ApplyDamage）")]
         public LayerMask DamageLayer;
 
-        [Tooltip("命中后延迟销毁弹道（秒，给各端命中特效留时间）")]
+        [Tooltip("判定胶囊半径（米）")]
+        public float HitRadius = 2f;
+
+        [Tooltip("判定胶囊总高度（米，含两端球冠；小于 2 × HitRadius 时按 2 × HitRadius 计算）")]
+        public float HitHeight = 8f;
+
+        [Tooltip("判定胶囊中心偏移（弹道本地空间，用于对齐视觉弹道中心）")]
+        public Vector3 HitCenterOffset = new Vector3(0f, -2f, 3f);
+
+        [Tooltip("命中后延迟销毁弹道（秒，给本端命中特效留时间）")]
         public float HitDespawnDelay = 0.3f;
+
+        /// <summary> 步骤内容时长 = 最大飞行时长 + 命中反馈保留时长（弹道自身生命窗口） </summary>
+        public override float Duration => MonsterProjectileTiming.GetFlightDuration(this) + Mathf.Max(0f, HitDespawnDelay);
     }
 
     /// <summary>
-    /// 弹道步骤（§16.4，点式）：Enter 时（权威端）生成弹道网络子实体（§0.1.2 简易形态），
-    /// 由弹道权威端自行飞行判定，命中经 MsgID.ApplyDamage 出伤害；
-    /// 本步骤持引用全权管理弹道生命周期（Dispose / 步骤退出清理）。
+    /// 弹道步骤：Enter 时各端本地实例化弹道（本地简易子实体），
+    /// 由弹道按本端时钟自行飞行与命中表现；伤害只在受击方权威端经 Msger 结算。
+    /// 本步骤持引用管理弹道生命周期（施法中断 / Dispose 清理飞行实例，已结束实例等待延迟销毁）。
     /// 直线弹道版；抛物线 / 落地爆炸变体等真实需求出现再泛化（YAGNI）。
     /// </summary>
     public class MonsterProjectileStep : MonsterSkillStep
     {
         private readonly MonsterProjectileStepConfig _projectileConfig;
 
-        /// <summary> 存活的弹道（权威端维护，Dispose / Exit 时清理） </summary>
-        private readonly List<NetworkObject> _liveProjectiles = new();
+        /// <summary> 存活的弹道（含已结束待延迟销毁的反馈实例，Dispose 时统一回收） </summary>
+        private readonly List<MonsterProjectile> _liveProjectiles = new();
 
         public MonsterProjectileStep(MonsterModel model, MonsterProjectileStepConfig config)
             : base(model, config)
@@ -62,133 +74,110 @@ namespace Game.Entities
 
         protected override void OnStepDispose()
         {
-            // 父实体销毁 → 清理全部存活子实体（§0.1.2 生命周期契约）
-            DespawnAllProjectiles();
+            // 父实体销毁 → 清理全部本地弹道与命中反馈
+            DestroyAllProjectiles();
         }
 
         protected override void OnStepExit()
         {
-            // 施法结束 / 打断：清理存活弹道（保守收口）
-            DespawnAllProjectiles();
+            // 重叠守卫会在后续步骤进入时截断本步骤窗口；弹道是步骤持有的 的本地生成物，
+            // 允许跨重叠步骤窗口继续本端飞行，清理统一挂到施法中断 / 父实体销毁。
+        }
+
+        protected override void OnStepCastAborted()
+        {
+            // 施法结束 / 中断：停止仍在飞行的弹道；已结束弹道保留命中反馈至延迟销毁
+            for (int i = _liveProjectiles.Count - 1; i >= 0; i--)
+            {
+                var projectile = _liveProjectiles[i];
+                if (projectile != null && !projectile.FlightEnded)
+                {
+                    UnityEngine.Object.Destroy(projectile.gameObject);
+                }
+            }
         }
 
         protected override void OnStepEnter(float elapsed)
         {
             if (_projectileConfig is null) return;
-            if (!HasStateAuthority) return;
 
-            SpawnProjectileAsync().Forget();
-        }
+            RemoveDestroyedProjectiles();
 
-        #region Private Methods
-
-        private async UniTaskVoid SpawnProjectileAsync()
-        {
-            if (_projectileConfig.ProjectilePrefab == null)
+            var selfTransform = _projectileConfig.SelfTransform;
+            if (selfTransform == null || _projectileConfig.ProjectilePrefab == null)
             {
-                Logging.Error("[MonsterProjectileStep] SpawnProjectileAsync: ProjectilePrefab 为 null，请检查 Inspector 引用。");
+                Logging.Error("[MonsterProjectileStep] OnStepEnter: SelfTransform / ProjectilePrefab 为空，请检查 Inspector 引用。");
                 return;
             }
 
-            var selfTransform = _projectileConfig.SelfTransform;
-            if (selfTransform == null) return;
-
-            // 发射参数：权威端本地解析目标位置（即用即弃）
+            // 各端用本端姿态与目标副本解析发射方向；轨迹只服务本端表现与受击方本地结算
             Vector3 spawnPos = MonsterProjectileTiming.GetSpawnPosition(_projectileConfig);
-            Vector3 aimPos = default;
-            bool hasTarget = false;
-            if (_model.CastTargetId.IsValid)
-            {
-                var targetObject = NetworkMgr.FindObject(_model.CastTargetId.NetId);
-                if (targetObject != null)
-                {
-                    aimPos = targetObject.transform.position;
-                    hasTarget = true;
-                }
-            }
-
+            bool hasTarget = TryGetTargetPosition(_model.CastTargetId, out Vector3 aimPos);
             Vector3 direction = MonsterProjectileTiming.ResolveDirection(
                 _projectileConfig,
                 spawnPos,
                 hasTarget,
                 aimPos
             );
-            float speed = MonsterProjectileTiming.GetSpeed(_projectileConfig);
-            float maxDistance = MonsterProjectileTiming.GetMaxDistance(_projectileConfig);
 
-            var projectileObj = await NetworkMgr.SpawnAsync(
+            var projectileObj = UnityEngine.Object.Instantiate(
                 _projectileConfig.ProjectilePrefab,
                 spawnPos,
-                Quaternion.LookRotation(direction),
-                onBeforeSpawned: (runner, netObj) =>
-                {
-                    // Spawn 前预初始化（仅权威端写入 [Networked] 首帧状态）
-                    if (netObj.TryGetComponent(out MonsterProjectile projectile))
-                    {
-                        projectile.PreInit(
-                            direction,
-                            speed,
-                            maxDistance,
-                            Mathf.Max(1, _projectileConfig.Damage),
-                            _model.Id,
-                            _model.CastTargetId,
-                            _projectileConfig.DamageLayer
-                        );
-                    }
-                }
+                Quaternion.LookRotation(direction)
             );
 
-            if (projectileObj == null)
+            if (!projectileObj.TryGetComponent(out MonsterProjectile projectile))
             {
-                Logging.Error("[MonsterProjectileStep] SpawnProjectileAsync: 弹道生成失败");
+                Logging.Error(
+                    $"[MonsterProjectileStep] OnStepEnter: ProjectilePrefab 缺 MonsterProjectile 组件 ({_projectileConfig.ProjectilePrefab.name})。"
+                );
+                UnityEngine.Object.Destroy(projectileObj);
                 return;
             }
 
-            _liveProjectiles.Add(projectileObj);
+            projectile.Initialize(
+                direction,
+                MonsterProjectileTiming.GetSpeed(_projectileConfig),
+                MonsterProjectileTiming.GetMaxDistance(_projectileConfig),
+                Mathf.Max(1, _projectileConfig.Damage),
+                _model.Id,
+                _projectileConfig.DamageLayer,
+                MonsterProjectileTiming.GetHitRadius(_projectileConfig),
+                MonsterProjectileTiming.GetHitHeight(_projectileConfig),
+                _projectileConfig.HitCenterOffset,
+                Mathf.Max(0f, _projectileConfig.HitDespawnDelay)
+            );
 
-            // 父实体（本步骤权威端）监听弹道飞行结束事实，延迟销毁（给各端命中特效留时间）
-            if (projectileObj.TryGetComponent(out MonsterProjectile projectileComp))
-            {
-                projectileComp.OnFlightEnded += OnProjectileFlightEnded;
-            }
+            MonsterSkillPresentation.PlayRandomSound(_projectileConfig.ProjectileSounds, projectile.transform);
+            _liveProjectiles.Add(projectile);
         }
 
-        private void OnProjectileFlightEnded(MonsterProjectile projectile)
-        {
-            // 守卫用弹道自身权威而非怪物根对象权威：
-            // 弹道 NetworkObject 的权威固定为生成端，怪物权威易主后原生成端仍负责其弹道销毁
-            if (projectile == null || !projectile.HasStateAuthority) return;
+        #region Private Methods
 
-            projectile.OnFlightEnded -= OnProjectileFlightEnded;
-
-            var projectileObj = projectile.Object;
-            if (projectileObj == null || !projectileObj.IsValid) return;
-
-            _liveProjectiles.Remove(projectileObj);
-            DespawnProjectileAsync(projectileObj, _projectileConfig.HitDespawnDelay).Forget();
-        }
-
-        private static async UniTaskVoid DespawnProjectileAsync(NetworkObject projectileObj, float delay)
-        {
-            await UniTask.Delay(TimeSpan.FromSeconds(Mathf.Max(0f, delay)));
-
-            if (projectileObj == null || !projectileObj.IsValid) return;
-            NetworkMgr.Despawn(projectileObj);
-        }
-
-        private void DespawnAllProjectiles()
+        private void RemoveDestroyedProjectiles()
         {
             for (int i = _liveProjectiles.Count - 1; i >= 0; i--)
             {
-                var projectile = _liveProjectiles[i];
-                if (projectile != null && projectile.IsValid)
+                if (_liveProjectiles[i] == null) _liveProjectiles.RemoveAt(i);
+            }
+        }
+
+        private void DestroyAllProjectiles()
+        {
+            for (int i = 0; i < _liveProjectiles.Count; i++)
+            {
+                if (_liveProjectiles[i] != null)
                 {
-                    NetworkMgr.Despawn(projectile);
+                    UnityEngine.Object.Destroy(_liveProjectiles[i].gameObject);
                 }
             }
+
             _liveProjectiles.Clear();
         }
 
         #endregion
     }
 }
+
+
+

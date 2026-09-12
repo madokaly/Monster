@@ -6,8 +6,8 @@ namespace Game.Components
 {
     /// <summary>
     /// 落石陨石纯表现组件（各端本地）：警告（生成即显示）→ 下落（运动学积分）→ 落地驻场 → 碎裂自毁。
-    /// 时序单源于落石步骤 Config（MonsterRockfallTiming 共享计算，§18.6.2）；
-    /// 判定归 Rockfall 步骤受击方本地结算，本组件不结算伤害（§1.5 事实与表现分流）。
+    /// 时序单源于落石步骤 Config（MonsterRockfallTiming 共享计算）；
+    /// 判定归 Rockfall 步骤受击方本地结算，本组件不结算伤害（事实与表现分流）。
     /// 驻场期间轮询落石事实的碎裂位掩码提前碎裂（遁地出土撞到本石 → 权威端置位 →
     /// 网络事实轮询，MonsterProjectileVisual 同范式）；掩码按 Seq 归属本轮，新一轮落石不误碎旧石。
     /// </summary>
@@ -189,7 +189,7 @@ namespace Game.Components
         }
 
         /// <summary>
-        /// 下落开始 fallAge 秒后石体距落点的高度（MonsterRockfallTiming 共享运动学，§18.6.2）。
+        /// 下落开始 fallAge 秒后石体距落点的高度（MonsterRockfallTiming 共享运动学）。
         /// </summary>
         private float GetFallHeightAt(float fallAge)
         {

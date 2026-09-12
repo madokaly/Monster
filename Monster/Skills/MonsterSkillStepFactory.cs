@@ -3,7 +3,7 @@ using Framework.Core;
 namespace Game.Entities
 {
     /// <summary>
-    /// 怪物技能步骤工厂：按 Config 具体类型分发的唯一 switch（§16.1）。
+    /// 怪物技能步骤工厂：按 Config 具体类型分发的唯一 switch。
     /// 步骤类型 = [SerializeReference] 多态 Config 类本身（无枚举、无表）。
     /// 新增步骤 = 新 StepConfig 子类 + 新 Step 类 + 本工厂一行；Ctrl / System / 总线零改动。
     /// </summary>
@@ -20,6 +20,10 @@ namespace Game.Entities
                     return new MonsterAreaHitStep(model, areaHitConfig);
                 case MonsterChaseStepConfig chaseConfig:
                     return new MonsterChaseStep(model, chaseConfig);
+                case MonsterAimStepConfig aimConfig:
+                    return new MonsterAimStep(model, aimConfig);
+                case MonsterChargeCrashStepConfig chargeConfig:
+                    return new MonsterChargeCrashStep(model, chargeConfig);
                 case MonsterSlamStepConfig slamConfig:
                     return new MonsterSlamStep(model, slamConfig);
                 case MonsterMeleeStepConfig meleeConfig:
@@ -34,12 +38,18 @@ namespace Game.Entities
                     return new MonsterBombingStep(model, bombingConfig);
                 case MonsterProjectileStepConfig projectileConfig:
                     return new MonsterProjectileStep(model, projectileConfig);
+                case MonsterWaterBallStepConfig waterBallConfig:
+                    return new MonsterWaterBallStep(model, waterBallConfig);
                 case MonsterBurrowStepConfig burrowConfig:
                     return new MonsterBurrowStep(model, burrowConfig);
                 case MonsterRockfallStepConfig rockfallConfig:
                     return new MonsterRockfallStep(model, rockfallConfig);
                 case MonsterSummonStepConfig summonConfig:
                     return new MonsterSummonStep(model, summonConfig);
+                case MonsterEntranceConcealStepConfig entranceConcealConfig:
+                    return new MonsterEntranceConcealStep(model, entranceConcealConfig);
+                case MonsterEntranceDescendStepConfig entranceDescendConfig:
+                    return new MonsterEntranceDescendStep(model, entranceDescendConfig);
                 default:
                     Logging.Warning(
                         $"[MonsterSkillStepFactory] Create: 未知步骤行为，跳过装配 ({config.GetType().Name})"

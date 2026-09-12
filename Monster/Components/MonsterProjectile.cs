@@ -1,106 +1,102 @@
-using System;
 using Framework;
-using Framework.Core;
-using Fusion;
 using Game.DTOs;
+using Game.Entities;
 using UnityEngine;
 
 namespace Game.Components
 {
     /// <summary>
-    /// 怪物弹道（网络子实体·简易形态身份主体）。
-    /// 只公开只读身份字段（EntityId 等）与父实体回调（OnFlightEnded），无对外行为方法；
-    /// 权威端本地自治飞行判定，命中 / 航程耗尽即结束，由父实体（技能模块）全权管理销毁。
+    /// 怪物弹道（本地简易子实体的行为主体）。
+    /// 各端本地自治飞行与命中表现；命中目标时仅目标 StateAuthority 端发送伤害命令，
+    /// 其余端只保留本端命中反馈。飞行结束后按延迟自毁，父步骤销毁时统一兜底回收。
     /// </summary>
-    public class MonsterProjectile : NetworkBehaviour
+    public class MonsterProjectile : MonoBehaviour
     {
         private readonly RaycastHit[] _hitBuffer = new RaycastHit[8];
 
-        // ===== 预初始化状态（onBeforeSpawned 由权威端写入，全端可读）=====
+        private Vector3 _direction;
+        private float _speed;
+        private float _maxDistance;
+        private int _damage;
+        private EntityId _attackerId;
+        private int _damageLayerMask;
+        private float _hitRadius;
+        private float _hitHeight;
+        private Vector3 _hitCenterOffset;
+        private float _despawnDelay;
+        private Vector3 _spawnPosition;
+        private bool _initialized;
 
-        [Networked]
-        public Vector3 Direction { get; private set; }
+        /// <summary> 本端是否已命中目标或环境 </summary>
+        public bool IsHit { get; private set; }
 
-        [Networked]
-        public float Speed { get; private set; }
-
-        [Networked]
-        public float MaxDistance { get; private set; }
-
-        [Networked]
-        public int Damage { get; private set; }
-
-        [Networked]
-        public EntityId AttackerId { get; private set; }
-
-        [Networked]
-        public EntityId TargetId { get; private set; }
-
-        [Networked]
-        public int DamageLayerMask { get; private set; }
-
-        // ===== 命中事实（全端感知，驱动命中特效）=====
-
-        [Networked, OnChangedRender(nameof(OnIsHitChangedHandler))]
-        public NetworkBool IsHit { get; private set; }
-
-        [Networked]
+        /// <summary> 本端命中点（命中表现用） </summary>
         public Vector3 HitPoint { get; private set; }
 
-        /// <summary> 飞行结束（命中 / 航程耗尽，仅权威端触发；父实体监听后销毁）</summary>
-        public event Action<MonsterProjectile> OnFlightEnded;
-
-        private Vector3 _spawnPos;
-        private bool _flightEnded;
+        /// <summary> 飞行是否已结束（命中 / 航程耗尽） </summary>
+        public bool FlightEnded { get; private set; }
 
         #region Lifecycle
 
-        public void PreInit(
+        public void Initialize(
             Vector3 direction,
             float speed,
             float maxDistance,
             int damage,
             EntityId attackerId,
-            EntityId targetId,
-            int damageLayerMask)
+            int damageLayerMask,
+            float hitRadius,
+            float hitHeight,
+            Vector3 hitCenterOffset,
+            float despawnDelay)
         {
-            Direction = direction;
-            Speed = speed;
-            MaxDistance = maxDistance;
-            Damage = damage;
-            AttackerId = attackerId;
-            TargetId = targetId;
-            DamageLayerMask = damageLayerMask;
-            IsHit = false;
-            HitPoint = default;
+            _direction = direction.sqrMagnitude > 0.001f ? direction.normalized : Vector3.forward;
+            _speed = speed;
+            _maxDistance = maxDistance;
+            _damage = damage;
+            _attackerId = attackerId;
+            _damageLayerMask = damageLayerMask;
+            _hitRadius = Mathf.Max(0f, hitRadius);
+            _hitHeight = Mathf.Max(0f, hitHeight);
+            _hitCenterOffset = hitCenterOffset;
+            _despawnDelay = Mathf.Max(0f, despawnDelay);
+            _spawnPosition = transform.position;
+            _initialized = true;
         }
 
-        public override void Spawned()
+        private void Update()
         {
-            _spawnPos = transform.position;
-        }
+            if (!_initialized || FlightEnded) return;
 
-        public override void FixedUpdateNetwork()
-        {
-            if (!HasStateAuthority) return;
-            if (_flightEnded) return;
+            float step = _speed * Time.deltaTime;
+            Vector3 nextPos = transform.position + _direction * step;
 
-            float step = Speed * Runner.DeltaTime;
-            Vector3 nextPos = transform.position + Direction * step;
-
-            // 命中判定：沿飞行路径扫掠（本地表现时间轴为基准）
+            // 命中判定：判定胶囊沿本端飞行路径扫掠；表现可分叉，结算只落在目标权威端。
+            // 按约定不做生成初始重叠补判，只覆盖当前帧起点到下一位置的飞行段。
             float castDistance = step + 0.1f;
             bool hasHit = false;
             var hit = default(RaycastHit);
 
-            if (DamageLayerMask != 0)
+            if (_damageLayerMask != 0 && _hitRadius > 0f)
             {
-                int hitCount = Physics.RaycastNonAlloc(
+                MonsterProjectileTiming.GetHitCapsuleAxisPoints(
+                    _hitRadius,
+                    _hitHeight,
                     transform.position,
-                    Direction,
+                    transform.rotation,
+                    _hitCenterOffset,
+                    out Vector3 lowerPoint,
+                    out Vector3 upperPoint
+                );
+
+                int hitCount = Physics.CapsuleCastNonAlloc(
+                    lowerPoint,
+                    upperPoint,
+                    _hitRadius,
+                    _direction,
                     _hitBuffer,
                     castDistance,
-                    DamageLayerMask,
+                    _damageLayerMask,
                     QueryTriggerInteraction.Ignore
                 );
 
@@ -118,20 +114,21 @@ namespace Game.Components
 
             if (hasHit)
             {
-                // 命中事实（全端感知，驱动命中特效）
                 HitPoint = hit.point;
                 IsHit = true;
 
-                // 命中实体（身份解析即用即弃）：发 ApplyDamage 出伤害；命中环境则只停
+                // 命中实体（身份解析即用即弃）：仅目标权威端结算；其他端只表现
                 var tag = hit.collider.GetComponentInParent<EntityTag>();
-                if (tag != null && tag.Id.IsValid)
+                if (tag != null
+                    && tag.Id.IsValid
+                    && MonsterSkillDamage.IsTargetAuthoritativeHere(tag.Id))
                 {
-                    var damageData = new DamageData { Damage = Damage, AttackerId = AttackerId, };
+                    var damageData = new DamageData { Damage = _damage, AttackerId = _attackerId, };
 
                     var hitData = new HitData()
                     {
                         HitPoint = hit.point,
-                        HitDirection = Direction,
+                        HitDirection = _direction,
                         Force = 0f,
                     };
 
@@ -146,7 +143,7 @@ namespace Game.Components
             transform.position = nextPos;
 
             // 航程耗尽
-            if (Vector3.Distance(transform.position, _spawnPos) >= MaxDistance)
+            if (Vector3.Distance(transform.position, _spawnPosition) >= _maxDistance)
             {
                 EndFlight();
             }
@@ -158,16 +155,10 @@ namespace Game.Components
 
         private void EndFlight()
         {
-            if (_flightEnded) return;
-            _flightEnded = true;
+            if (FlightEnded) return;
 
-            OnFlightEnded?.Invoke(this);
-        }
-
-        private void OnIsHitChangedHandler()
-        {
-            if (HasStateAuthority) return;
-            // 代理端命中表现由视觉组件轮询本字段，无需事件
+            FlightEnded = true;
+            Destroy(gameObject, _despawnDelay);
         }
 
         #endregion

@@ -1,5 +1,6 @@
 using Framework;
 using Fusion;
+using Game.DTOs;
 using UnityEngine;
 
 namespace Game.Entities
@@ -31,7 +32,7 @@ namespace Game.Entities
         /// 受到伤害（领域规则内聚）：
         /// 无敌 / 死亡守卫 → 防御减免 → Hp / Guard 扣减 → 受击反应 → 死亡触发。
         /// </summary>
-        public void TakeDamage(int damage, EntityId attacker)
+        public void TakeDamage(DamageData damageData)
         {
             if (!HasStateAuthority) return;
             if (IsDead()) return;
@@ -40,13 +41,14 @@ namespace Game.Entities
             // 标记进入过战斗（覆盖远程打一下就跑的场景，回血资格永久成立）
             MarkInCombat();
 
-            // 记录参与伤害的实体（掉落分派名单；击杀者同样入账）
-            AddAttacker(attacker);
+            // 记录参与伤害的攻击与玩家归属（掉落分派名单；击杀者同样入账）
+            AddAttackerPlayer(damageData);
 
-            int finalDamage = Mathf.Max(damage - Def, 1);
+            int finalDamage = Mathf.Max(damageData.Damage - Def, 1);
 
             SetHp(Hp - finalDamage);
             SetGuard(Guard - finalDamage);
+            AccumulateCastInterruptDamage(finalDamage);
 
             if (IsDead()) return;
 
@@ -166,17 +168,18 @@ namespace Game.Entities
         /// <summary>
         /// 进入破防（领域规则：打断施法 → 破防动画 + 恢复计时）
         /// </summary>
-        private void EnterGuardBroken()
+        private void EnterGuardBroken(int breakAnimId)
         {
             InterruptCasting();
             SetHitAnimTimer(default);
 
             const float BREAK_RECOVERY_TIME = 15f;
+            breakAnimId = breakAnimId > 0 ? breakAnimId : BreakAnim;
 
             // 先 Timer 后 AnimId（MonsterModel.Anim.cs 纪律）
-            SetGuardBrokenAnimTimer(TickTimer.CreateFromSeconds(Runner, GetAnimLength(BreakAnim)));
+            SetGuardBrokenAnimTimer(TickTimer.CreateFromSeconds(Runner, GetAnimLength(breakAnimId)));
             SetGuardBrokenRecoveryTimer(TickTimer.CreateFromSeconds(Runner, BREAK_RECOVERY_TIME));
-            SetAnimId(BreakAnim);
+            SetAnimId(breakAnimId);
         }
 
         /// <summary>

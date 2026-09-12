@@ -45,11 +45,11 @@ namespace Game.Components
     }
 
     /// <summary>
-    /// 召唤物行为基类（本地简易子实体的行为主体，§0.1.3 本地变体）：
-    /// 由 MonsterSummonStep 在各端本地实例化，只发不收（伤害经 Msger 受击方本地结算，§1.7）、
+    /// 召唤物行为基类（本地简易子实体的行为主体，本地变体）：
+    /// 由 MonsterSummonStep 在各端本地实例化，只发不收（伤害经 Msger 受击方本地结算）、
     /// 生命周期自管（时间轴播完自毁；StopDamage 停伤不停表现；父实体销毁时由步骤统一回收）。
     /// 子类 = 单个召唤技能的全部逻辑（时间轴 / 表现 / 判定），数值时序内联序列化字段。
-    /// 预演契约（§18.6）：SampleTimeline 为时间的纯函数（可正反拖动、禁物理禁伤害禁总线），
+    /// 预演契约：SampleTimeline 为时间的纯函数（可正反拖动、禁物理禁伤害禁总线），
     /// GetDamageWindows 声明式输出当前时刻判定几何，Editor 通用适配器统一驱动与绘制——
     /// 新子类零预演代码。
     /// </summary>
@@ -175,6 +175,17 @@ namespace Game.Components
                 particleSystem.Simulate(Mathf.Max(0f, age), false, true, false);
                 particleSystem.Pause(false);
             }
+        }
+
+        /// <summary>
+        /// 模式感知销毁（预演在编辑模式运行——Destroy 于编辑模式不生效会泄漏实例，必须 DestroyImmediate）。
+        /// </summary>
+        protected static void DestroyEffect(GameObject effect)
+        {
+            if (effect == null) return;
+
+            if (Application.isPlaying) Destroy(effect);
+            else DestroyImmediate(effect);
         }
 
         #endregion

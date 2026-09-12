@@ -4,14 +4,15 @@ using UnityEngine;
 namespace Game.Entities
 {
     /// <summary>
-    /// 怪物技能链运行器（ModuleBase；每链一个，Ctrl Spawned 装配，§16.1）。
-    /// 监听 Model 施放脉冲按链身份过滤；本端以单一时钟推进时间线
-    /// （权威端 = Runner 仿真时钟 FUN，代理端 = 本地时钟 Update）：
-    /// 步骤 Enter / Tick / Exit；链级进入动画由 Model.TryCastChain 内部级联写入（§1.4 硬约束），
-    /// 步骤进入动画（StepAnimIds 随机）由权威端时间线 tick 经 Model 写 AnimId
-    /// （[Networked] 状态事实，全端播放）；链 / 步骤特效与音效各端本地随机播（§16.3）。
+    /// 怪物技能链运行器（ModuleBase；每链一个，Ctrl Spawned 装配）。
+    /// 监听 Model 施放脉冲按链身份过滤；双端统一以本地时钟在 Update 每帧推进时间线
+    /// （不在仿真回调里；NetworkTransform 仍按仿真节奏采样快照，不增网络量）：
+    /// 步骤 Enter / Tick / Exit；链级进入动画由 Model.TryCastChain 内部级联写入（硬约束），
+    /// 步骤进入动画（StepAnimIds 随机）由权威端在时间线推进内经 Model 写 AnimId
+    /// （[Networked] 状态事实，全端播放）；链 / 步骤特效与音效各端本地随机播。
+    /// 权威端身份只用于状态事实写入（AnimId / MoveCommand / PushBodyRotation）；
     /// 行为逻辑（移动 / 选点 / 状态写入）在步骤内部按 HasStateAuthority 分流，
-    /// 伤害判定与结算恒为受击方本地结算（§1.7）；链身份 = 链索引（Model.CastingChainIndex）。
+    /// 伤害判定与结算恒为受击方本地结算；链身份 = 链索引（Model.CastingChainIndex）。
     /// </summary>
     public class MonsterSkillChainRunner : ModuleBase
     {
@@ -23,7 +24,7 @@ namespace Game.Entities
         /// <summary> 是否处于"本次施放进行中"（本端本地） </summary>
         private bool _casting;
 
-        /// <summary> 本次施放的本端起点（权威端 SimulationTime / 代理端 Time.time，按端取用） </summary>
+        /// <summary> 本次施放的本端起点（本地时钟 Time.time） </summary>
         private float _castStartTime;
 
         /// <summary> 当前活跃步骤索引（本端时钟推进；-1 = 无） </summary>
@@ -102,11 +103,11 @@ namespace Game.Entities
             if (_model.CastingChainIndex != _chainIndex) return;
 
             _casting = true;
-            _castStartTime = HasStateAuthority ? (float)_model.Runner.SimulationTime : Time.time;
+            _castStartTime = Time.time;
             _activeStepIndex = -1;
 
-            // 链级进入表现：动画由 Model 在 TryCastChain 内完成（数据驱动级联内聚于 Model，§1.4 硬约束），
-            // 本 handler 内不反写 Model；特效 / 音效各端本地随机播（§16.3）
+            // 链级进入表现：动画由 Model 在 TryCastChain 内完成（数据驱动级联内聚于 Model，硬约束），
+            // 本 handler 内不反写 Model；特效 / 音效各端本地随机播
             MonsterSkillPresentation.PlayRandomEffect(_chain.EnterEffects);
             MonsterSkillPresentation.PlayRandomSound(_chain.EnterSounds, _chain.SoundAttachPoint);
         }
@@ -125,21 +126,15 @@ namespace Game.Entities
 
         #region Ticks
 
-        protected override void OnFixedUpdateNetwork(float deltaTime)
-        {
-            if (!HasStateAuthority) return;
-            AdvanceTimeline(CastElapsed);
-        }
-
         protected override void OnUpdate(float deltaTime)
         {
-            if (HasStateAuthority) return;
+            // 逻辑通道：双端统一每帧推进（Update 时刻，时序先于动画阶段）
             AdvanceTimeline(CastElapsed);
         }
 
         protected override void OnLateUpdate(float deltaTime)
         {
-            // 每帧视觉更新（权威 / 代理统一每帧节奏，Ctrl LateUpdate 转发）：仅活跃步骤
+            // 表现通道：每帧视觉更新（Ctrl LateUpdate 转发，动画 / IK 后采样）：仅活跃步骤
             if (!_casting || _activeStepIndex < 0) return;
 
             var active = _steps[_activeStepIndex];
@@ -232,7 +227,7 @@ namespace Game.Entities
             var config = _chain.Steps[index];
             var step = _steps[index];
 
-            // 步骤进入动画：权威端随机写（替换当前动画；数组空 = 不写，§16.3）
+            // 步骤进入动画：权威端随机写（替换当前动画；数组空 = 不写）
             if (HasStateAuthority)
             {
                 WriteStepAnimId(config.StepAnimIds);
@@ -242,16 +237,14 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 施放相对时间（本端单一时钟：权威端 Runner 仿真时间 / 代理端本地时间；未施放恒为 0）。
+        /// 施放相对时间（双端统一的本地时钟；未施放恒为 0）。
         /// </summary>
         private float CastElapsed
         {
             get
             {
                 if (!_casting) return 0f;
-                return HasStateAuthority
-                    ? (float)_model.Runner.SimulationTime - _castStartTime
-                    : Time.time - _castStartTime;
+                return Time.time - _castStartTime;
             }
         }
 
@@ -260,8 +253,8 @@ namespace Game.Entities
         #region Private Methods
 
         /// <summary>
-        /// 权威端随机取一个步骤动画 Id 经 Model 写入（[Networked] 状态事实全端播；空数组 / 非正 Id 跳过，§16.3）。
-        /// 仅用于步骤进入（时间线 tick 内的命令式写入，非 Model 事件 handler 反写，§1.4 硬约束允许）。
+        /// 权威端随机取一个步骤动画 Id 经 Model 写入（[Networked] 状态事实全端播；空数组 / 非正 Id 跳过）。
+        /// 仅用于步骤进入（时间线推进内的命令式写入，非 Model 事件 handler 反写，硬约束允许）。
         /// 链级进入动画已收归 Model.TryCastChain 内部级联。
         /// </summary>
         private void WriteStepAnimId(int[] animIds)
@@ -287,6 +280,13 @@ namespace Game.Entities
                 {
                     active.Exit();
                 }
+            }
+
+            // 施法级收口要遍历全部步骤：Projectile 等本地生成物可跨重叠步骤窗口继续存在，
+            // 不能只清理当前活跃步骤；已自然结束的生成物由各步骤按自身状态幂等跳过。
+            for (int i = 0; i < _steps.Length; i++)
+            {
+                _steps[i]?.AbortCast();
             }
 
             _activeStepIndex = -1;

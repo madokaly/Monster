@@ -1,6 +1,7 @@
 using System;
 using Framework;
 using Framework.Core;
+using Game.Components;
 using UnityEngine;
 using Random = UnityEngine.Random;
 
@@ -32,6 +33,12 @@ namespace Game.Entities
         public float PatrolWaitDuration = 2f;
         [Tooltip("巡逻点采样重试次数")]
         public int PatrolPointAttempts = 10;
+        [Tooltip("巡逻点投影到 NavMesh 的最大水平距离（米）")]
+        public float PatrolProjectionMaxHorizontalDistance = 3f;
+        [Tooltip("巡逻点投影到 NavMesh 的最大垂直距离（米）")]
+        public float PatrolProjectionMaxVerticalDistance = 10f;
+        [Tooltip("巡逻点全部不可达时的重采样间隔（秒）")]
+        public float PatrolSampleRetryDelay = 0.5f;
         [Tooltip("巡逻停距")]
         public float PatrolStopDistance = 2f;
 
@@ -84,6 +91,9 @@ namespace Game.Entities
         /// <summary> 巡逻原地等待计时 </summary>
         private float _patrolWaitTimer;
 
+        /// <summary> 巡逻点采样失败后的重采样计时 </summary>
+        private float _patrolRetryTimer;
+
         // ===== 追击目标点（节流重算，逐 tick 重申）=====
 
         private bool _hasChaseDestination;
@@ -92,6 +102,17 @@ namespace Game.Entities
 
         /// <summary> 上一 tick 是否处于施法态（用于识别施法结束，立即重算移动意图） </summary>
         private bool _wasCasting;
+
+        // ===== 环境就绪（本地物理 + 导航，票 18）=====
+
+        /// <summary> 环境就绪检查间隔（秒；纯查询节流，CanSimulateAt 走 primary Chunk 裁决） </summary>
+        private const float ENVIRONMENT_CHECK_INTERVAL = 0.5f;
+
+        /// <summary> 本端环境就绪缓存（CanSimulateAt + 导航图在场；就绪恢复由移动指令自愈） </summary>
+        private bool _environmentReady;
+
+        /// <summary> 环境就绪检查累积计时（归零 = 下 tick 立即重查，SA 变更 / 启动恢复边沿触发） </summary>
+        private float _environmentCheckTimer;
 
         #region Lifecycle
 
@@ -114,10 +135,12 @@ namespace Game.Entities
 
         protected override void OnStateAuthorityChanged()
         {
-            // 权威易主：清空本地决策中间态，从 Model 状态事实重新决策
+            // 权威易主：清空本地决策中间态，从 Model 状态事实重新决策；
+            // 环境就绪立即重查（启动 / 恢复边沿验证本地物理与导航，票 18）
             _intent = MonsterIntent.Idle;
             _patrolWaitTimer = 0f;
             _wasCasting = false;
+            _environmentCheckTimer = 0f;
             ResetMoveDecisionCache();
             SetStopIntent();
         }
@@ -173,10 +196,20 @@ namespace Game.Entities
                 return;
             }
 
-            // 冻结门控（§16.5：owner == 本端玩家实体才驱动决策与移动指令）：
-            // owner 无效（冻结）或 owner 指向其他端（权威交接瞬态）→ 停发移动指令，
-            // Follower 停止由 MonsterMoveModule 监听同一事实执行
-            if (!IsOwnerLocalPlayer())
+            // 登场技是出生表现的一部分：只要本端持有 StateAuthority 就立即消耗，
+            // 不依赖 SimulationOwner 候选 / 环境门。普通 AI 与移动仍保持冻结门控。
+            // 停驻事实由登场步骤在进入时间线时写入；冻结态这里不额外下发移动指令。
+            if (_model.ActState == MonsterActState.Free && TryCastSpawnOnceSkill())
+            {
+                SetStopIntent();
+                return;
+            }
+
+            // 冻结门控（：SimulationOwner == 本端玩家实体才驱动决策与移动指令）：
+            // owner 无效（冻结，无候选）或 owner 指向其他端（权威交接瞬态）→ 停发移动指令，
+            // Follower 停止由 MonsterMoveModule 监听同一事实执行；
+            // 环境未就绪（本地物理 / 导航缺失）同路处理——启动 / 恢复每窗验证（票 18）
+            if (!IsOwnerLocalPlayer() || !TickEnvironmentReady(deltaTime))
             {
                 SetStopIntent();
                 return;
@@ -227,10 +260,28 @@ namespace Game.Entities
         /// </summary>
         private bool IsOwnerLocalPlayer()
         {
-            var owner = _model.DesiredAuthorityOwner;
+            var owner = _model.SimulationOwner;
             if (!owner.IsValid) return false;
             if (owner == Svcer.Req<EntityId>(SvcID.QueryLocalPlayer)) return true;
             return owner == Svcer.Req<EntityId>(SvcID.QueryLocalMech);
+        }
+
+        /// <summary>
+        /// 环境就绪门（票 18：启动 / 恢复都验证本地物理与导航 Ready）：
+        /// 0.5s 节流缓存 <see cref="LocalPhysicsCoverage.CanSimulateAt"/>（纯查询）+ 导航图在场；
+        /// 就绪恢复无需专门事件——后续移动指令经 MoveModule 自愈（重开 simulateMovement）。
+        /// </summary>
+        private bool TickEnvironmentReady(float deltaTime)
+        {
+            if (_environmentCheckTimer > 0f)
+            {
+                _environmentCheckTimer -= deltaTime;
+                return _environmentReady;
+            }
+
+            _environmentCheckTimer = ENVIRONMENT_CHECK_INTERVAL;
+            _environmentReady = LocalPhysicsCoverage.CanSimulateAt(SelfPosition) && AstarPath.active != null;
+            return _environmentReady;
         }
 
         /// <summary>
@@ -250,6 +301,7 @@ namespace Game.Entities
                 _intent = MonsterIntent.Chase;
                 _hasPatrolPoint = false;
                 _patrolWaitTimer = 0f;
+                _patrolRetryTimer = 0f;
                 _hasChaseDestination = false; // 立即刷新追击目标点
                 _chaseCommandTimer = 0f;
 
@@ -261,10 +313,18 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 追击行为：目标丢失 / 硬脱战 → 脱战；技能就绪且在射程 → 施法；否则追近。
+        /// 追击行为：目标丢失 / 硬脱战 / 自身越过遭遇边界 → 脱战；技能就绪且在射程 → 施法；否则追近。
         /// </summary>
         private void TickChase(MonsterPerceptionSnapshot snapshot, float deltaTime)
         {
+            // 自身已越过遭遇脱战边界（：不得无限跨 Chunk 追击）→ 立即脱战；
+            // 返回由脱战冷却后的巡逻意图自然完成（巡逻锚在边界内，票 18）
+            if (IsOutsideEncounterLeash())
+            {
+                EnterDisengage();
+                return;
+            }
+
             // 目标丢失，或仅脱战圈内有目标（追不上了）→ 进入脱战流程
             if (!snapshot.HasAnyTarget || snapshot.RangeType == 3)
             {
@@ -309,6 +369,14 @@ namespace Game.Entities
         {
             _intent = MonsterIntent.Patrol;
 
+            // 上轮采样没有任何可达巡逻点：先停留，避免每个模拟帧反复查询导航图
+            if (_patrolRetryTimer > 0f)
+            {
+                _patrolRetryTimer -= deltaTime;
+                SetStopIntent();
+                return;
+            }
+
             // 正在原地等待
             if (_patrolWaitTimer > 0f)
             {
@@ -340,10 +408,15 @@ namespace Game.Entities
                 return;
             }
 
-            // 采样新巡逻点（失败 → 走回巡逻中心）
-            _currentPatrolPoint = TrySamplePatrolPoint(out var patrolPoint) ? patrolPoint : _model.PatrolCenter;
-            _hasPatrolPoint = true;
+            // 采样新巡逻点；没有任何可达点时保留停止意图，等待下一轮重采样
+            if (!TrySamplePatrolPoint(out _currentPatrolPoint))
+            {
+                _patrolRetryTimer = Mathf.Max(0.1f, _config.PatrolSampleRetryDelay);
+                SetStopIntent();
+                return;
+            }
 
+            _hasPatrolPoint = true;
             BuildMoveIntent(
                 _currentPatrolPoint, _config.PatrolMoveSpeed, MonsterGait.Walk, _config.PatrolStopDistance);
         }
@@ -363,7 +436,7 @@ namespace Game.Entities
 
         /// <summary>
         /// 从冷却就绪且目标在射程内的技能链中按 Weight 加权抽选并施放。
-        /// 技能池 = Ctrl 序列化的链列表（§18.2），权重 0 不进池。
+        /// 技能池 = Ctrl 序列化的链列表，权重 0 不进池。
         /// </summary>
         private bool TryCastReadySkill(MonsterPerceptionSnapshot snapshot)
         {
@@ -379,6 +452,9 @@ namespace Game.Entities
             {
                 var chain = _model.GetChain(i);
                 if (chain is null) continue;
+
+                // 登场链不进入普通权重池，只在生成后由 TryCastSpawnOnceSkill 优先触发。
+                if (chain.CastTrigger != MonsterSkillCastTrigger.AiWeighted) continue;
 
                 // 权重 0 不进技能池
                 if (chain.Weight <= 0) continue;
@@ -401,6 +477,29 @@ namespace Game.Entities
 
             return selectedChainIndex >= 0
                 && _model.TryCastChain(selectedChainIndex, snapshot.BestTargetId);
+        }
+
+        #endregion
+
+        #region Spawn Once
+
+        /// <summary>
+        /// 施放生成后一次性链。无目标、无距离守卫；成功写入 CastCount 后即消耗，权威易主不重试。
+        /// </summary>
+        private bool TryCastSpawnOnceSkill()
+        {
+            if (_model.CastCount != 0) return false;
+
+            for (int i = 0; i < _model.ChainCount; i++)
+            {
+                var chain = _model.GetChain(i);
+                if (chain is null || chain.CastTrigger != MonsterSkillCastTrigger.SpawnOnce) continue;
+                if (!_model.IsChainConfigured(i)) continue;
+
+                return _model.TryCastChain(i, default);
+            }
+
+            return false;
         }
 
         #endregion
@@ -438,6 +537,17 @@ namespace Game.Entities
             _hasChaseDestination = false;
             _chaseCommandTimer = 0f;
             _hasPatrolPoint = false;
+            _patrolRetryTimer = 0f;
+        }
+
+        /// <summary>
+        /// 自身是否已越过遭遇脱战边界（XZ 水平距）；无遭遇恒为 false。
+        /// </summary>
+        private bool IsOutsideEncounterLeash()
+        {
+            if (!_model.TryGetEncounterLeash(out var center, out float leashRange)) return false;
+
+            return HorizontalDistance(SelfPosition, center) > leashRange;
         }
 
         /// <summary>
@@ -464,12 +574,14 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 在巡逻半径内采样随机巡逻点
+        /// 在巡逻半径内采样能从当前位置到达的 NavMesh 点
         /// </summary>
         private bool TrySamplePatrolPoint(out Vector3 patrolPoint)
         {
             patrolPoint = _model.PatrolCenter;
+            if (_config.SelfTransform == null) return false;
 
+            Vector3 selfPosition = _config.SelfTransform.position;
             float radius = Mathf.Max(0.1f, _model.PatrolRadius);
             Vector3 center = _model.PatrolCenter;
             int attempts = Mathf.Max(1, _config.PatrolPointAttempts);
@@ -478,17 +590,26 @@ namespace Game.Entities
             {
                 Vector2 randomCircle = Random.insideUnitCircle * radius;
                 var candidate = center + new Vector3(randomCircle.x, 0f, randomCircle.y);
+                if (!TryResolveReachablePatrolPoint(selfPosition, candidate, out var safeCandidate)) continue;
 
-                if (_hasPatrolPoint && HorizontalDistance(candidate, _currentPatrolPoint) < _config.PatrolStopDistance)
-                {
-                    continue;
-                }
-
-                patrolPoint = candidate;
+                patrolPoint = safeCandidate;
                 return true;
             }
 
-            return false;
+            return TryResolveReachablePatrolPoint(selfPosition, center, out patrolPoint);
+        }
+
+        /// <summary>
+        /// 校验巡逻候选点，并返回投影后的 NavMesh 落点
+        /// </summary>
+        private bool TryResolveReachablePatrolPoint(Vector3 selfPosition, Vector3 candidate, out Vector3 patrolPoint)
+        {
+            return MonsterNavigationQuery.TryProjectToReachableNode(
+                selfPosition,
+                candidate,
+                _config.PatrolProjectionMaxHorizontalDistance,
+                _config.PatrolProjectionMaxVerticalDistance,
+                out patrolPoint);
         }
 
         /// <summary>

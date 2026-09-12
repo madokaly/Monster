@@ -36,7 +36,7 @@ namespace Game.Entities
         public float ContactHitRadius = 2f;
 
         [Tooltip("撞伤受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Tooltip("撞伤高度过滤（受击目标与判定原点高度差超过该值不命中；<=0 不过滤）")]
         public float MaxAttackHeight;
@@ -48,7 +48,7 @@ namespace Game.Entities
     /// 追击步骤：窗口内限角旋转 + 限距位移逼近目标（单目标）。
     /// Enter（权威端）记录起点 / 算落点（触发距离外才位移）/ 停 Follower 让位；
     /// Tick（权威端）按窗口进度 lerp 旋转与位移；
-    /// 撞伤（可选）各端本端时钟结算（受击方本地结算 §1.7，判定原点 = 本端怪物位置）；
+    /// 撞伤（可选）各端本端时钟结算（受击方本地结算，判定原点 = 本端怪物位置）；
     /// 施放结束由 AI 恢复寻路（同旧制）。
     /// </summary>
     public class MonsterChaseStep : MonsterSkillStep
@@ -89,7 +89,7 @@ namespace Game.Entities
                 StepChase(t);
             }
 
-            // 撞伤（各端受击方本地结算，本端时钟 + 本端怪物位置，§1.7；内容结束即停伤）
+            // 撞伤（各端受击方本地结算，本端时钟 + 本端怪物位置；内容结束即停伤）
             if (!IsContentEnded && _chaseConfig.ContactDamage > 0)
             {
                 SettleContactDamage();

@@ -64,7 +64,7 @@ namespace Game.Entities
         public int EndAoeDamage = 1;
 
         [Tooltip("出土 AOE 受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Tooltip("伤害结算层（对层内目标判定命中并发 ApplyDamage；0 = 不过滤）")]
         public LayerMask DamageLayer;
@@ -107,7 +107,7 @@ namespace Game.Entities
     /// NavMesh 内且贴地 Y 跟随，玩家无法引导出网卡死；可贴近目标提前出土）→ 出土（切出土动画 +
     /// 身体恢复 + 碰撞体恢复 + AOE 结算 + 无敌关 + 停移动）。
     /// 移动指令 / 相位机 / 提前出土传感器 / 无敌 / 动画写入在权威端（感知与结算分离）；
-    /// 撞伤与出土 AOE 各端受击方本地结算（§1.7——代理端按链尾时间到路径表现，
+    /// 撞伤与出土 AOE 各端受击方本地结算（代理端按链尾时间到路径表现，
     /// 判定落在本端看到的时刻，所见即所得）；身体显隐 / 碰撞体 / 特效 / 音效各端本地。
     /// 出土撞陨石自眩晕（旧制 DiveGround 的 stun 语义：撞的是 boss 自己）：
     /// 权威端出土时按 Model 落石事实检测未失效锚点，命中即置位该石碎裂位
@@ -209,7 +209,7 @@ namespace Game.Entities
                 SpawnMoveEffect();
             }
 
-            // 各端：地下撞伤（受击方本地结算 §1.7；时间窗 = 追踪期开始 → 本端出土 / 内容结束，
+            // 各端：地下撞伤（受击方本地结算；时间窗 = 追踪期开始 → 本端出土 / 内容结束，
             // 代理端按链尾时间到路径表现，撞伤随本端地下视角延续至本端出土时刻；收尾段不结算）
             if (!_emerged
                 && !IsContentEnded
@@ -299,8 +299,8 @@ namespace Game.Entities
 
         /// <summary>
         /// 下发 / 刷新寻路指令（权威端）：目标实时位置为目的地，速度 = TrackSpeed、停距 = 撞伤半径
-        /// （到位即贴近目标，供提前出土传感器触发）。落点投影合法节点由 MoveModule 保证；
-        /// 目标不可达时 Follower 停在最近可达点，超时强制出土兜底。
+        /// （到位即贴近目标，供提前出土传感器触发）。落点投影与连通性由 MoveModule 统一校验；
+        /// 目标不可达时移动指令被拒绝并停止移动，本步骤等待追踪超时强制出土兜底。
         /// </summary>
         private void RefreshTrackingDestination(float stepElapsed)
         {
@@ -339,7 +339,7 @@ namespace Game.Entities
             }
 
             // 贴近目标提前出土（感知与结算分离：权威端纯位置查询驱动自身行为，
-            // 移动距离达标判据防贴脸秒出土；撞伤判定归各端受击方本地，§1.7）
+            // 移动距离达标判据防贴脸秒出土；撞伤判定归各端受击方本地）
             if (_burrowConfig.EndOnHitTrackedTarget
                 && IsNearTrackedTarget()
                 && _movedDistance >= _burrowConfig.MinMoveDistanceForHit)
@@ -374,7 +374,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 地下撞伤（各端受击方本地结算，§1.7）：怪物位置 OverlapSphere 小半径，
+        /// 地下撞伤（各端受击方本地结算）：怪物位置 OverlapSphere 小半径，
         /// 仅结算 SA 在本端的目标，同目标按间隔去重（非本端目标不结算、不记录去重）。
         /// </summary>
         private void SettleTriggerHit()
@@ -406,7 +406,7 @@ namespace Game.Entities
                 EntityId targetId = tag.Id;
                 if (!targetId.IsValid) continue;
 
-                // 受击方本地结算（§1.7）：非本端目标交目标权威端自行判定
+                // 受击方本地结算：非本端目标交目标权威端自行判定
                 if (!MonsterSkillDamage.IsTargetAuthoritativeHere(targetId)) continue;
 
                 if (_burrowConfig.TriggerHitInterval > 0f
@@ -442,9 +442,9 @@ namespace Game.Entities
 
         /// <summary>
         /// 出土（各端在本端时刻执行）：身体恢复 + 碰撞体恢复 + 出土音效 + 销毁地下特效（表现）
-        /// + 出土 AOE 结算（受击方本地 §1.7，落在本端看到的出土时刻）；停移动 / 无敌关 /
+        /// + 出土 AOE 结算（受击方本地，落在本端看到的出土时刻）；停移动 / 无敌关 /
         /// 出土动画写入 / 撞石置位与眩晕检测（权威端）。权威端提前出土时代理端仍在地下表现，
-        /// 按链尾时间到路径收口（§1.7 偏差允许）。
+        /// 按链尾时间到路径收口（偏差允许）。
         /// </summary>
         private void DoEmerge()
         {
@@ -472,7 +472,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 出土 AOE（各端受击方本地结算，§1.7）：怪物位置单次球形结算，复用基类共享管线。
+        /// 出土 AOE（各端受击方本地结算）：怪物位置单次球形结算，复用基类共享管线。
         /// </summary>
         private void SettleEmergeAoe()
         {

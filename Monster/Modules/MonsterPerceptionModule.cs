@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using TbMonsterspawn = cfg.TbMonsterspawn;
 using Framework;
 using Framework.Core;
 using Fusion;
+using Pathfinding;
 using UnityEngine;
 
 namespace Game.Entities
@@ -23,6 +25,19 @@ namespace Game.Entities
         /// </summary>
         [Tooltip("需要收集的 AOI 目标标签，按仇恨优先顺序排列")]
         public List<string> TargetAoiTags;
+
+        [Tooltip("是否仅索敌所属遭遇 primary Chunk 内的目标（Chunk 从遭遇中心派生，不序列化 ChunkId）")]
+        public bool RestrictTargetsToEncounterChunk;
+
+        [Header("Navigation Filter")]
+        [Tooltip("是否要求目标能从怪物当前 NavMesh 节点寻路到达（用于近似真实可行动区域）")]
+        public bool RequirePathReachableTarget;
+
+        [Tooltip("目标投影到 NavMesh 的最大水平距离（米；超出视为不在可行动区域）")]
+        public float PathProjectionMaxHorizontalDistance = 3f;
+
+        [Tooltip("目标投影到 NavMesh 的最大垂直距离（米；允许实体根节点与地面存在高度差）")]
+        public float PathProjectionMaxVerticalDistance = 6f;
 
         [Header("Range")]
         /// <summary>
@@ -99,6 +114,10 @@ namespace Game.Entities
             if (_config is null) return;
             if (!HasStateAuthority) return;
 
+            // 模拟门控（票 18）：owner 指向本端玩家实体才刷新感知——
+            // 无人区 / 交接瞬态不做 AOI 查询（无人区零 AI CPU 的主要开销源）
+            if (!IsOwnerLocalPlayer()) return;
+
             _refreshTimer -= deltaTime;
             if (_refreshTimer > 0f) return;
             _refreshTimer = Mathf.Max(0.05f, _config.RefreshInterval);
@@ -152,17 +171,29 @@ namespace Game.Entities
             }
 
             Vector3 currentPos = _config.SelfTransform.position;
-            Vector3 spawnPos = _model.PatrolCenter;
 
             float searchRange = ResolveSearchRange(_model, _config);
             float chaseRange = ResolveChaseRange(_model, _config);
-            float disengageRadius = Mathf.Max(chaseRange, ResolveDisengageRadius(_model, _config));
+
+            // 脱战锚（票 18，单一影响源）：遭遇怪 = 遭遇中心 + leash_range（组级硬边界，
+            // 不得无限跨 Chunk 追击）；无遭遇 = 出生点 + 追击圈（reset_range 已废除，半径回退追击圈）
+            bool hasLeash = _model.TryGetEncounterLeash(out Vector3 leashCenter, out float leashRange);
+            Vector3 disengageCenter = hasLeash ? leashCenter : _model.PatrolCenter;
+            float disengageRadius = hasLeash ? leashRange : chaseRange;
 
             // AOI 查询：以怪物当前位置为中心，半径需同时覆盖
             //   - 当前位置 + chaseRange（追击圈）
-            //   - 出生位置 + disengageRadius（脱战圈；通过出生点半径 + 当前到出生点距离折算）
-            float spawnToCurrentDist = HorizontalDistance(currentPos, spawnPos);
-            float aoiMaxRange = Mathf.Max(chaseRange, spawnToCurrentDist + disengageRadius);
+            //   - 脱战锚 + disengageRadius（脱战圈；通过锚点半径 + 当前到锚点距离折算）
+            float anchorToCurrentDist = HorizontalDistance(currentPos, disengageCenter);
+            float aoiMaxRange = Mathf.Max(chaseRange, anchorToCurrentDist + disengageRadius);
+
+            int encounterChunkId = 0;
+            if (_config.RestrictTargetsToEncounterChunk
+                && !TryResolveEncounterChunkId(out encounterChunkId))
+            {
+                _model.SetPerceptionSnapshot(default);
+                return;
+            }
 
             _aoiBuffer.Clear();
             AOIMgr.FindTargetsInRange(
@@ -173,7 +204,29 @@ namespace Game.Entities
                 _config.SelfTransform.gameObject
             );
 
-            CollectTargets(currentPos, spawnPos, searchRange, chaseRange, disengageRadius);
+            GraphNode pathStartNode = null;
+            if (_config.RequirePathReachableTarget
+                && !MonsterNavigationQuery.TryProjectToWalkableNode(
+                    currentPos,
+                    _config.PathProjectionMaxHorizontalDistance,
+                    _config.PathProjectionMaxVerticalDistance,
+                    out pathStartNode,
+                    out _))
+            {
+                _model.SetPerceptionSnapshot(default);
+                return;
+            }
+
+            CollectTargets(
+                currentPos,
+                disengageCenter,
+                searchRange,
+                chaseRange,
+                disengageRadius,
+                _config.RestrictTargetsToEncounterChunk,
+                encounterChunkId,
+                _config.RequirePathReachableTarget,
+                pathStartNode);
 
             _model.SetPerceptionSnapshot(BuildSnapshot());
         }
@@ -194,25 +247,49 @@ namespace Game.Entities
             return cfg != null && cfg.AlertRange > 0 ? cfg.AlertRange : 0f;
         }
 
-        private static float ResolveDisengageRadius(MonsterModel model, MonsterPerceptionModuleConfig config)
+        /// <summary> owner 事实是否指向本端玩家实体（MainPlayer 或本端玩家驾驶的 Mech） </summary>
+        /// <summary>
+        /// 解析所属遭遇中心的 primary Chunk（配置缺失 / 空间非法时保守失败）。
+        /// </summary>
+        private bool TryResolveEncounterChunkId(out int chunkId)
         {
-            return model is not null && model.DisengageRadius > 0f
-                ? model.DisengageRadius
-                : ResolveChaseRange(model, config);
+            chunkId = 0;
+
+            var tables = ConfigMgr.Tables;
+            var encounterCfg = _model?.EncounterCfg;
+            if (tables == null || encounterCfg == null) return false;
+
+            chunkId = tables.TbChunk.GetPrimaryChunkId(TbMonsterspawn.DeriveEncounterCenter(encounterCfg));
+            return chunkId != 0;
+        }
+
+        /// <summary> owner 事实是否指向本端玩家实体（MainPlayer 或本端玩家驾驶的 Mech） </summary>
+        private bool IsOwnerLocalPlayer()
+        {
+            var owner = _model.SimulationOwner;
+            if (!owner.IsValid) return false;
+            if (owner == Svcer.Req<EntityId>(SvcID.QueryLocalPlayer)) return true;
+            return owner == Svcer.Req<EntityId>(SvcID.QueryLocalMech);
         }
 
         /// <summary>
         /// 按三层范围把 AOI 结果拆分到不同缓存。
         /// - Search ⊆ Chase：以怪物当前位置为圆心。
-        /// - OutOfCombat（脱战圈）：以出生位置为圆心，disengageRadius 为半径。
+        /// - OutOfCombat（脱战圈）：以脱战锚为圆心（遭遇中心 / 出生点），disengageRadius 为半径。
         /// 硬性脱战边界：脱战圈已无目标时，即便内圈还有目标也不能继续锁定（视作无目标）。
+        /// 开启 Chunk 硬门控时，目标自身 primary Chunk 不属于遭遇主块则不进入任何候选层。
+        /// 开启寻路硬门控时，目标必须投影到合法 NavMesh 且与怪物当前节点连通。
         /// </summary>
         private void CollectTargets(
             Vector3 currentPos,
-            Vector3 spawnPos,
+            Vector3 disengageCenter,
             float searchRange,
             float chaseRange,
-            float disengageRadius)
+            float disengageRadius,
+            bool restrictToEncounterChunk,
+            int encounterChunkId,
+            bool requirePathReachable,
+            GraphNode pathStartNode)
         {
             _searchCandidates.Clear();
             _chaseCandidates.Clear();
@@ -227,26 +304,38 @@ namespace Game.Entities
                 GameObject target = _aoiBuffer[i];
                 if (target == null) continue;
 
-                // 身份解析：即用即弃，只提取 EntityId（§1.6）
+                // 身份解析：即用即弃，只提取 EntityId
                 EntityId entityId = ResolveTargetId(target);
                 if (!entityId.IsValid) continue;
 
                 Vector3 targetPos = target.transform.position;
+
+                if (restrictToEncounterChunk
+                    && ConfigMgr.Tables.TbChunk.GetPrimaryChunkId(targetPos) != encounterChunkId)
+                {
+                    continue;
+                }
+
+                if (requirePathReachable
+                    && !TryIsPathReachable(pathStartNode, targetPos))
+                {
+                    continue;
+                }
 
                 // 离当前怪物的距离（XZ 平面）
                 Vector3 toCurrent = targetPos - currentPos;
                 toCurrent.y = 0f;
                 float distFromCurrentSqr = toCurrent.sqrMagnitude;
 
-                // 离出生点的距离（XZ 平面）
-                Vector3 toSpawn = targetPos - spawnPos;
-                toSpawn.y = 0f;
-                float distFromSpawnSqr = toSpawn.sqrMagnitude;
+                // 离脱战锚的距离（XZ 平面）
+                Vector3 toAnchor = targetPos - disengageCenter;
+                toAnchor.y = 0f;
+                float distFromAnchorSqr = toAnchor.sqrMagnitude;
 
                 var candidate = new TargetCandidate(entityId, distFromCurrentSqr, GetHatredPriority(target));
 
-                // 脱战圈：以出生位置为圆心
-                if (distFromSpawnSqr <= disengageRadiusSqr)
+                // 脱战圈：以脱战锚为圆心（遭遇中心 / 出生点）
+                if (distFromAnchorSqr <= disengageRadiusSqr)
                 {
                     _outOfCombatCandidates.Add(candidate);
                 }
@@ -263,6 +352,21 @@ namespace Game.Entities
                     _searchCandidates.Add(candidate);
                 }
             }
+        }
+
+        /// <summary>
+        /// 判断目标位置是否与怪物起始节点处于同一 NavMesh 连通区域。
+        /// 先用水平 / 垂直投影容差收窄到真实可行动区域，再使用 A* 预计算连通性，避免逐目标完整寻路。
+        /// </summary>
+        private bool TryIsPathReachable(GraphNode startNode, Vector3 targetPos)
+        {
+            return startNode != null
+                   && MonsterNavigationQuery.TryProjectToReachableNode(
+                       startNode,
+                       targetPos,
+                       _config.PathProjectionMaxHorizontalDistance,
+                       _config.PathProjectionMaxVerticalDistance,
+                       out _);
         }
 
         /// <summary>
@@ -404,10 +508,17 @@ namespace Game.Entities
                 ? ResolveChaseRange(model, config)
                 : Mathf.Max(0f, config.ChaseRange);
 
+            // 脱战锚与判定同源（票 18）：遭遇怪画遭遇中心 + leash，无遭遇画出生点 + 追击圈
+            bool hasLeash = false;
+            Vector3 leashCenter = default;
+            float leashRange = 0f;
+            if (hasRuntimeData) hasLeash = model.TryGetEncounterLeash(out leashCenter, out leashRange);
             Vector3 currentCenter = selfTransform.position;
-            Vector3 disengageCenter = hasRuntimeData ? model.PatrolCenter : currentCenter;
+            Vector3 disengageCenter = hasRuntimeData
+                ? (hasLeash ? leashCenter : model.PatrolCenter)
+                : currentCenter;
             float disengageRadius = hasRuntimeData
-                ? Mathf.Max(chaseRange, ResolveDisengageRadius(model, config))
+                ? (hasLeash ? leashRange : chaseRange)
                 : chaseRange;
 
             // 轻微错开高度，避免相同半径的线圈完全互相覆盖。

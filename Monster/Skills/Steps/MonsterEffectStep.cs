@@ -8,9 +8,9 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 纯表现占位步骤（§16.4，点式）：无自身字段，进入表现（StepEffects / StepSounds）由基类 Enter 统一播放
+    /// 纯表现占位步骤（点式）：无自身字段，进入表现（StepEffects / StepSounds）由基类 Enter 统一播放
     /// （各端本地随机，不与链内其他步骤的结算冲突）。不结算任何伤害——伤害由链内 AreaHit 等步骤表达，
-    /// 表现与判定分离（§1.5 事实与表现分流）。
+    /// 表现与判定分离（事实与表现分流）。
     /// </summary>
     public class MonsterEffectStep : MonsterSkillStep
     {

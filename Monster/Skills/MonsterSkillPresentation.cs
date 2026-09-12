@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Game.Entities
 {
     /// <summary>
-    /// 技能进入表现共享管线（§16.3）：链级（EnterEffects / EnterSounds）与步骤级（StepEffects / StepSounds）
+    /// 技能进入表现共享管线：链级（EnterEffects / EnterSounds）与步骤级（StepEffects / StepSounds）
     /// 各端本地随机播一个（两端可能不同，遵循 Melee 旧制 CastSoundPaths 先例）；空数组 = 跳过。
     /// 动画不在本类：权威端随机取一后经 Model.SetAnimId（[Networked] 状态事实）全端一致播放（调用方负责）。
     /// </summary>
@@ -20,23 +20,43 @@ namespace Game.Entities
             if (settingsArray is not { Length: > 0 }) return;
 
             var settings = settingsArray[Random.Range(0, settingsArray.Length)];
-            if (settings == null) return;
-            if (settings.Prefab == null) return;
+            PlayEffect(settings, fallbackTransform);
+        }
+
+        public static GameObject PlayEffect(MonsterEffectSettings settings, Transform fallbackTransform = null)
+        {
+            return PlayEffect(settings, 0f, fallbackTransform);
+        }
+
+        /// <summary>
+        /// 播放一个指定特效（各端本地）。lifetimeOverride > 0 时用于阶段步骤覆盖默认存活时长。
+        /// </summary>
+        public static GameObject PlayEffect(
+            MonsterEffectSettings settings,
+            float lifetimeOverride,
+            Transform fallbackTransform = null)
+        {
+            if (settings == null || settings.Prefab == null) return null;
 
             var attach = settings.AttachPoint != null
                 ? settings.AttachPoint
                 : settings.FallbackTransform != null
                     ? settings.FallbackTransform
                     : fallbackTransform;
-            if (attach == null) return;
+            if (attach == null) return null;
 
             var effectObj = Object.Instantiate(settings.Prefab, attach.position, attach.rotation, attach);
             effectObj.transform.localPosition = settings.Offset;
             effectObj.transform.localEulerAngles = settings.Rotation;
             effectObj.transform.localScale = settings.Scale;
 
-            float lifetime = settings.Lifetime > 0f ? settings.Lifetime : 3f;
+            float lifetime = lifetimeOverride > 0f
+                ? lifetimeOverride
+                : settings.Lifetime > 0f
+                    ? settings.Lifetime
+                    : 3f;
             Object.Destroy(effectObj, Mathf.Max(0.1f, lifetime));
+            return effectObj;
         }
 
         /// <summary>

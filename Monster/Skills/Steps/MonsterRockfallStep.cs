@@ -32,7 +32,7 @@ namespace Game.Entities
         public int InnerDamage = 500;
 
         [Tooltip("受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Header("Rocks（前半圆环随机陨石，锚点定长 3）")]
         [Tooltip("陨石数量（1~3）")]
@@ -91,9 +91,9 @@ namespace Game.Entities
 
     /// <summary>
     /// 落石步骤：内圈持续 AOE + 前半圆环随机陨石（警告 → 下落 → 落地结算 → 驻场 → 碎裂）。
-    /// 权威端选点一次写入 Model.RockfallState（落点跨端同步，§1.7 状态事实）；
+    /// 权威端选点一次写入 Model.RockfallState（落点跨端同步，状态事实）；
     /// 各端轮询 Seq 在锚点本地生成陨石表现体（驻场自生命周期，步骤退出不回收）；
-    /// 全部伤害各端按共享时序（MonsterRockfallTiming）受击方本地结算（§1.7）——
+    /// 全部伤害各端按共享时序（MonsterRockfallTiming）受击方本地结算——
     /// 单石落地以「本次施放的 Seq 到达本端」为结算门槛（防上一轮旧锚点）。
     /// </summary>
     public class MonsterRockfallStep : MonsterSkillStep
@@ -150,7 +150,7 @@ namespace Game.Entities
             // 各端本地：落石事实更新（代理端网络迟到容忍）→ 生成陨石表现体
             TrySpawnRockVisuals(stepElapsed);
 
-            // 内圈 AOE 周期 tick（各端受击方本地结算，§1.7）
+            // 内圈 AOE 周期 tick（各端受击方本地结算）
             if (MonsterRockfallTiming.IsInnerAoeActive(_rockfallConfig, stepElapsed)
                 && stepElapsed >= _nextInnerTickTime)
             {

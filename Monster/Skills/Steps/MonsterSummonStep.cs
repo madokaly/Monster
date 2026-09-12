@@ -27,9 +27,9 @@ namespace Game.Entities
     }
 
     /// <summary>
-    /// 召唤步骤：各端本地实例化召唤物（本地简易子实体，§0.1.3 本地变体——只发不收、
+    /// 召唤步骤：各端本地实例化召唤物（本地简易子实体，本地变体——只发不收、
     /// 无自有 Id、不注册 EntityRegistry），行为逻辑全部内聚在 prefab 上的 MonsterSummonBehaviour
-    /// 派生组件（自带时间轴 / 表现 / 判定，各端本地自治，§1.7）。
+    /// 派生组件（自带时间轴 / 表现 / 判定，各端本地自治）。
     /// 步骤职责收敛为「放置 + 生命周期收口」：内容结束（StepDuration）→ StopDamage（停伤不停表现，
     /// 收尾段表现继续）；Exit → 兜底停伤（打断 / 截断收敛，幂等）；
     /// Dispose（实体销毁）→ 销毁全部存活实例（父销毁子必销）。
@@ -106,7 +106,7 @@ namespace Game.Entities
 
         protected override void OnStepDispose()
         {
-            // 父实体销毁 → 子实体必销毁（§0.1.3 生命周期契约）
+            // 父实体销毁 → 子实体必销毁（生命周期契约）
             for (int i = 0; i < _liveSummons.Count; i++)
             {
                 if (_liveSummons[i] != null)

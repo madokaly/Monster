@@ -44,24 +44,27 @@ namespace Game.Entities
         [Tooltip("伤害结算层（对层内目标判定命中并发 ApplyDamage；0 = 不过滤）")]
         public LayerMask DamageLayer;
 
+        [Tooltip("地面层（特效贴地 raycast 用；0 = 特效保持目标 Y）")]
+        public LayerMask GroundLayer;
+
         [Tooltip("单段爆炸伤害")]
         public int Damage = 1;
 
         [Tooltip("受击方向反作用力")]
-        public float HitForce = 5f;
+        public float HitForce = 0f;
 
         [Header("Effects")]
-        [Tooltip("追踪圈特效 prefab（纯表现，各端本地实例化于目标脚下并跟随）")]
+        [Tooltip("追踪圈特效 prefab（纯表现，各端本地实例化并水平跟随目标，Y 贴地面层）")]
         public GameObject TrackingEffectPrefab;
         public Vector3 TrackingEffectPosOffset = Vector3.zero;
         public Vector3 TrackingEffectRotOffset = Vector3.zero;
 
-        [Tooltip("锁定标记特效 prefab（纯表现，锁定时刻实例化于锁定位置）")]
+        [Tooltip("锁定标记特效 prefab（纯表现，锁定时刻实例化于锁定水平位置，Y 贴地面层）")]
         public GameObject LockEffectPrefab;
         public Vector3 LockEffectPosOffset = Vector3.zero;
         public Vector3 LockEffectRotOffset = Vector3.zero;
 
-        [Tooltip("导弹 + 爆炸特效 prefab（纯表现，自带下落编排与爆炸音效；各端本地在导弹生成时刻实例化）")]
+        [Tooltip("导弹 + 爆炸特效 prefab（纯表现，自带下落编排与爆炸音效；各端本地在导弹生成时刻实例化，Y 贴地面层）")]
         public GameObject BombEffectPrefab;
         public Vector3 BombEffectPosOffset = Vector3.zero;
         public Vector3 BombEffectRotOffset = Vector3.zero;
@@ -83,8 +86,9 @@ namespace Game.Entities
     /// <summary>
     /// 定点轰炸步骤：定位附近目标 → 追踪圈跟随 → 锁定 → 多段轰炸（圆心在锁定位置）。
     /// 目标选择与锁定位置各端本地解析；各端在爆炸时刻按本端锁定位置逐段结算
-    /// （受击方本地结算 §1.7——判定基准与本端轰炸表现同源，所见即所得，每段每目标一次）；
-    /// 追踪圈跟随 / 锁定标记 / 导弹特效各端本地时钟播放。
+    /// （受击方本地结算——判定基准与本端轰炸表现同源，所见即所得，每段每目标一次）；
+    /// 追踪圈逐帧跟随目标走表现通道（LateUpdate 采样）、锁定标记 / 导弹特效按边沿时刻播放，
+    /// 特效只取目标水平位置，Y 贴地面层（不随目标跳起落下）。
     /// </summary>
     public class MonsterBombingStep : MonsterSkillStep
     {
@@ -93,7 +97,7 @@ namespace Game.Entities
         /// <summary> 本端选择的目标（表现跟随 / 锁定位置解析来源；各端各自解析） </summary>
         private readonly List<EntityId> _targetIds = new();
 
-        /// <summary> 锁定位置（本端解析；本端结算基准，§1.7） </summary>
+        /// <summary> 锁定位置（本端解析；本端结算基准） </summary>
         private readonly List<Vector3> _lockedPositions = new();
 
         /// <summary> 本端：追踪圈特效实例（与 _targetIds 对齐；目标丢失置 null） </summary>
@@ -136,12 +140,6 @@ namespace Game.Entities
 
             float stepElapsed = elapsed - _config.StartOffset;
 
-            // 追踪期：特效跟随目标
-            if (!_locked && stepElapsed < _bombingConfig.TrackDuration)
-            {
-                FollowTrackingEffects();
-            }
-
             // 锁定时刻
             if (!_locked && stepElapsed >= _bombingConfig.TrackDuration)
             {
@@ -150,6 +148,19 @@ namespace Game.Entities
 
             // 导弹生成（各端）与爆炸结算（权威端）
             UpdateBombs(stepElapsed);
+        }
+
+        protected override void OnStepVisualUpdate(float elapsed)
+        {
+            if (_bombingConfig is null) return;
+
+            float stepElapsed = elapsed - _config.StartOffset;
+
+            // 追踪期：特效逐帧跟随目标（表现通道，动画 / IK 后采样）
+            if (!_locked && stepElapsed < _bombingConfig.TrackDuration)
+            {
+                FollowTrackingEffects();
+            }
         }
 
         protected override void OnStepExit()
@@ -211,7 +222,7 @@ namespace Game.Entities
                 {
                     effect = UnityEngine.Object.Instantiate(
                         _bombingConfig.TrackingEffectPrefab,
-                        targetPos + _bombingConfig.TrackingEffectPosOffset,
+                        ProjectToGround(targetPos) + _bombingConfig.TrackingEffectPosOffset,
                         Quaternion.Euler(_bombingConfig.TrackingEffectRotOffset)
                     );
                     if (!string.IsNullOrEmpty(_bombingConfig.TrackingSoundPath))
@@ -224,7 +235,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 追踪期逐 tick：特效跟随目标；目标丢失（脱战 / 死亡）销毁圈。
+        /// 追踪期逐帧：特效跟随目标；目标丢失（脱战 / 死亡）销毁圈。
         /// </summary>
         private void FollowTrackingEffects()
         {
@@ -235,7 +246,7 @@ namespace Game.Entities
 
                 if (i < _targetIds.Count && TryGetTargetPosition(_targetIds[i], out var targetPos))
                 {
-                    effect.transform.position = targetPos + _bombingConfig.TrackingEffectPosOffset;
+                    effect.transform.position = ProjectToGround(targetPos) + _bombingConfig.TrackingEffectPosOffset;
                 }
                 else
                 {
@@ -278,7 +289,7 @@ namespace Game.Entities
                 {
                     var lockEffect = UnityEngine.Object.Instantiate(
                         _bombingConfig.LockEffectPrefab,
-                        _lockedPositions[i] + _bombingConfig.LockEffectPosOffset,
+                        ProjectToGround(_lockedPositions[i]) + _bombingConfig.LockEffectPosOffset,
                         Quaternion.Euler(_bombingConfig.LockEffectRotOffset)
                     );
                     _lockEffects.Add(lockEffect);
@@ -308,7 +319,7 @@ namespace Game.Entities
                 _nextBombSpawnIndex++;
             }
 
-            // 各端：爆炸结算（受击方本地，§1.7，本端锁定位置为圆心）
+            // 各端：爆炸结算（受击方本地，本端锁定位置为圆心）
             while (_nextBombSettleIndex < _bombingConfig.BombWaves
                    && stepElapsed >= MonsterBombingTiming.GetBombSettleTime(
                        _bombingConfig,
@@ -332,7 +343,7 @@ namespace Game.Entities
             {
                 var bombEffect = UnityEngine.Object.Instantiate(
                     _bombingConfig.BombEffectPrefab,
-                    _lockedPositions[i] + _bombingConfig.BombEffectPosOffset,
+                    ProjectToGround(_lockedPositions[i]) + _bombingConfig.BombEffectPosOffset,
                     Quaternion.Euler(_bombingConfig.BombEffectRotOffset)
                 );
                 _bombEffects.Add(bombEffect);
@@ -344,7 +355,7 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 单段结算（各端受击方本地结算，§1.7）：每个锁定位置一次球形结算，
+        /// 单段结算（各端受击方本地结算）：每个锁定位置一次球形结算，
         /// 共享去重集（每段每目标一次，多圈重叠去重），复用基类共享管线。
         /// </summary>
         private void SettleBomb()
@@ -372,6 +383,21 @@ namespace Game.Entities
         #endregion
 
         #region Private Methods
+
+        /// <summary>
+        /// 表现贴地：保留水平位置，Y 取地面层落点（未配置 / 未命中回落原 Y）。
+        /// </summary>
+        private Vector3 ProjectToGround(Vector3 position)
+        {
+            if (_bombingConfig.GroundLayer == 0) return position;
+
+            Vector3 rayStart = position + Vector3.up * 5f;
+            if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 100f, _bombingConfig.GroundLayer, QueryTriggerInteraction.Ignore))
+            {
+                return new Vector3(position.x, hit.point.y, position.z);
+            }
+            return position;
+        }
 
         private void DestroyAllEffects()
         {

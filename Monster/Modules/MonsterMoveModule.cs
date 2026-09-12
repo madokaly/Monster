@@ -1,6 +1,7 @@
 using System;
 using Framework;
 using Framework.Core;
+using Game.Components;
 using Pathfinding;
 using UnityEngine;
 
@@ -22,6 +23,11 @@ namespace Game.Entities
 
         [Tooltip("生成时吸附 NavMesh 的最大距离（0 = 不吸附）")]
         public float SnapMaxDistance = 100f;
+
+        [Tooltip("移动目标投影到 NavMesh 的最大水平距离（米）")]
+        public float DestinationProjectionMaxHorizontalDistance = 3f;
+        [Tooltip("移动目标投影到 NavMesh 的最大垂直距离（米）")]
+        public float DestinationProjectionMaxVerticalDistance = 10f;
     }
 
     /// <summary>
@@ -35,6 +41,12 @@ namespace Game.Entities
         private readonly MonsterMoveModuleConfig _config;
 
         private bool _snapped;
+
+        /// <summary> 不可达移动目标告警间隔（秒） </summary>
+        private const float INVALID_DESTINATION_WARNING_INTERVAL = 5f;
+
+        /// <summary> 不可达移动目标告警计时 </summary>
+        private float _invalidDestinationWarningTimer;
 
         #region Lifecycle
 
@@ -71,6 +83,11 @@ namespace Game.Entities
             if (_config is null) return;
             if (!HasStateAuthority) return;
 
+            if (_invalidDestinationWarningTimer > 0f)
+            {
+                _invalidDestinationWarningTimer -= deltaTime;
+            }
+
             ReportMoveSpeedFact();
         }
 
@@ -87,7 +104,7 @@ namespace Game.Entities
             _model.OnBodyRotationPushed += OnBodyRotationPushedHandler;
 
             _model.OnMoveCommandChanged += OnMoveCommandChangedHandler;
-            _model.OnDesiredAuthorityOwnerChanged += OnDesiredAuthorityOwnerChangedHandler;
+            _model.OnSimulationOwnerChanged += OnSimulationOwnerChangedHandler;
         }
 
         private void ClearModelListeners()
@@ -99,7 +116,7 @@ namespace Game.Entities
             _model.OnBodyRotationPushed -= OnBodyRotationPushedHandler;
 
             _model.OnMoveCommandChanged -= OnMoveCommandChangedHandler;
-            _model.OnDesiredAuthorityOwnerChanged -= OnDesiredAuthorityOwnerChangedHandler;
+            _model.OnSimulationOwnerChanged -= OnSimulationOwnerChangedHandler;
         }
 
         private void RegisterComponentListeners()
@@ -202,7 +219,7 @@ namespace Game.Entities
         /// 归属事实变化（全端）：仅权威端反应——冻结（owner 无效）关停移动模拟，
         /// 解冻恢复模拟开关（移动指令由 AI 决策随后的 tick 重新下达）。
         /// </summary>
-        private void OnDesiredAuthorityOwnerChangedHandler(EntityId ownerId)
+        private void OnSimulationOwnerChangedHandler(EntityId ownerId)
         {
             if (_config is null) return;
             if (!HasStateAuthority) return;
@@ -227,15 +244,22 @@ namespace Game.Entities
                 return;
             }
 
-            // 目标点投影到合法节点（防 GridGraph 边界 / 斜向连接异常）
-            var destination = command.Destination;
-            if (TryProjectToValidPoint(destination, null, out var safeDestination))
+            // 目标必须能从当前位置到达；否则停止移动，不能把 NavMesh 外坐标交给寻路代理
+            var follower = _config.Follower;
+            if (!MonsterNavigationQuery.TryProjectToReachableNode(
+                    follower.transform.position,
+                    command.Destination,
+                    _config.DestinationProjectionMaxHorizontalDistance,
+                    _config.DestinationProjectionMaxVerticalDistance,
+                    out var safeDestination))
             {
-                destination = safeDestination;
+                StopMovementInternal();
+                WarnInvalidDestination(follower, command.Destination);
+                return;
             }
 
             PrepareMovementInternal(command.MoveSpeed, command.StopDistance);
-            _config.Follower.destination = destination;
+            follower.destination = safeDestination;
         }
 
         #endregion
@@ -318,9 +342,10 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 模拟门控 = owner 事实指向本端玩家实体（§16.5）：冻结（owner 无效）或 owner 指向其他端
-        /// （权威交接瞬态）→ 停 Follower + 关移动模拟（权威端场景已卸载时无寻路图，避免无图模拟）；
-        /// 解冻只恢复模拟开关，具体移动由 AI 决策下一 tick 的移动指令驱动。
+        /// 模拟门控 = owner 事实指向本端玩家实体且本地环境就绪（票 18：启动 / 恢复
+        /// 都验证本地物理与导航）：冻结（owner 无效）、owner 指向其他端（权威交接瞬态）或
+        /// 本端覆盖 / 寻路图缺失 → 停 Follower + 关移动模拟（避免无图模拟）；
+        /// 解冻 / 就绪恢复只重开模拟开关，具体移动由 AI 决策下一 tick 的移动指令驱动自愈。
         /// </summary>
         private void RefreshFrozenState()
         {
@@ -331,7 +356,7 @@ namespace Game.Entities
                 return;
             }
 
-            bool simulate = IsOwnerLocalPlayer();
+            bool simulate = IsOwnerLocalPlayer() && IsEnvironmentReady();
 
             if (!simulate)
             {
@@ -347,10 +372,18 @@ namespace Game.Entities
         /// <summary> owner 事实是否指向本端玩家实体（MainPlayer 或本端玩家驾驶的 Mech） </summary>
         private bool IsOwnerLocalPlayer()
         {
-            var owner = _model.DesiredAuthorityOwner;
+            var owner = _model.SimulationOwner;
             if (!owner.IsValid) return false;
             if (owner == Svcer.Req<EntityId>(SvcID.QueryLocalPlayer)) return true;
             return owner == Svcer.Req<EntityId>(SvcID.QueryLocalMech);
+        }
+
+        /// <summary> 本地环境就绪：primary Chunk Ready（纯查询）+ 导航图在场 </summary>
+        private bool IsEnvironmentReady()
+        {
+            if (_config.Body == null) return false;
+
+            return LocalPhysicsCoverage.CanSimulateAt(_config.Body.position) && AstarPath.active != null;
         }
 
         /// <summary>
@@ -406,62 +439,17 @@ namespace Game.Entities
         }
 
         /// <summary>
-        /// 将世界坐标投影到最近的合法可行走节点，同时过滤缺失轴并列连接的边缘节点。
+        /// 记录不可达移动目标；节流告警，避免追踪目标持续变化时刷屏
         /// </summary>
-        private static bool TryProjectToValidPoint(
-            Vector3 worldPosition,
-            System.Collections.Generic.IReadOnlyList<int> allowedGraphTags,
-            out Vector3 result)
+        private void WarnInvalidDestination(FollowerEntity follower, Vector3 destination)
         {
-            result = worldPosition;
+            if (_invalidDestinationWarningTimer > 0f) return;
 
-            if (AstarPath.active == null) return false;
-
-            var constraint = NearestNodeConstraint.Walkable;
-            constraint.tags = BuildAllowedGraphTagsMask(allowedGraphTags);
-            constraint.distanceMetric = DistanceMetric.ClosestAsSeenFromAbove();
-
-            var nearestInfo = AstarPath.active.GetNearest(worldPosition, constraint);
-            if (nearestInfo.node == null) return false;
-
-            if (!HasValidAxisAlignedConnections(nearestInfo.node)) return false;
-
-            result = (Vector3)nearestInfo.position;
-            return true;
-        }
-
-        /// <summary>
-        /// 检查 GridNodeBase 四个轴并列方向（上下左右）是否都存在有效的可行走连接。
-        /// 若某方向缺失，PathTracer.RemoveGridPathDiagonals 会抛出 "Axis-aligned connection not found"。
-        /// </summary>
-        private static bool HasValidAxisAlignedConnections(GraphNode node)
-        {
-            if (node is not GridNodeBase gridNode) return true; // 非 Grid 图无需检查
-            for (int dir = 0; dir < 4; dir++)
-            {
-                var neighbor = gridNode.GetNeighbourAlongDirection(dir);
-                if (neighbor == null || !neighbor.Walkable) return false;
-            }
-            return true;
-        }
-
-        /// <summary>
-        /// 构建 A* Graph Tag 位掩码（未配置时默认允许全部标签）
-        /// </summary>
-        private static int BuildAllowedGraphTagsMask(System.Collections.Generic.IReadOnlyList<int> allowedGraphTags)
-        {
-            if (allowedGraphTags == null || allowedGraphTags.Count == 0) return -1;
-
-            int mask = 0;
-            for (int i = 0; i < allowedGraphTags.Count; i++)
-            {
-                int tag = allowedGraphTags[i];
-                if (tag is < 0 or >= 32) continue;
-
-                mask |= 1 << tag;
-            }
-
-            return mask == 0 ? -1 : mask;
+            _invalidDestinationWarningTimer = INVALID_DESTINATION_WARNING_INTERVAL;
+            Logging.Warning(
+                $"[MonsterMoveModule] 移动目标不可达，已停止移动 "
+                + $"(self={follower.transform.position}, destination={destination})"
+            );
         }
 
         #endregion

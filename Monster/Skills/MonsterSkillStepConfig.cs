@@ -5,7 +5,7 @@ namespace Game.Entities
 {
     /// <summary>
     /// 怪物技能原子步骤配置基类（链内序列化的行为单元；[SerializeReference] 多态）。
-    /// 步骤自带该行为的数值 / 时序 / 表现引用（不经配置表，§16.2）。
+    /// 步骤自带该行为的数值 / 时序 / 表现引用（不经配置表）。
     /// 新增步骤 = 新 StepConfig 子类 + 新 Step 类 + 工厂一行。
     /// </summary>
     [Serializable]
@@ -31,7 +31,7 @@ namespace Game.Entities
         public Transform SoundAttachPoint;
 
         /// <summary>
-        /// 步骤内容时长（秒），由各步骤自身时序字段派生（单一可信源，§18.6.3）。
+        /// 步骤内容时长（秒），由各步骤自身时序字段派生（单一可信源）。
         /// 窗口式步骤（&gt;0）的内容逻辑（伤害窗口 / 相位 / 追结）在 [StartOffset, StartOffset+Duration] 内完成；
         /// 点式步骤（0）在 StartOffset 时刻一次性结算。不含收尾延迟。
         /// </summary>

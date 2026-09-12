@@ -86,6 +86,28 @@ namespace Game.Entities
     }
 
     /// <summary>
+    /// Aim 的平面转向单一计算入口（运行时转向与 Editor 预演共用）。
+    /// </summary>
+    public static class MonsterAimTiming
+    {
+        public static Quaternion RotateTowardsPlanarTarget(
+            Quaternion rotation,
+            Vector3 targetDirection,
+            float maxDegrees)
+        {
+            Vector3 direction = targetDirection;
+            direction.y = 0f;
+            if (direction.sqrMagnitude <= 0.0001f) return rotation;
+
+            return Quaternion.RotateTowards(
+                rotation,
+                Quaternion.LookRotation(direction),
+                Mathf.Max(0f, maxDegrees)
+            );
+        }
+    }
+
+    /// <summary>
     /// InstantShot 结算时刻的单一计算入口。
     /// </summary>
     public static class MonsterInstantShotTiming
@@ -122,6 +144,9 @@ namespace Game.Entities
             return config.SelfTransform.position + config.SelfTransform.rotation * config.SpawnOffset;
         }
 
+        /// <summary>
+        /// 解析水平发射方向：目标锁定忽略 Y 偏移，弹道保持发射点高度直线飞行。
+        /// </summary>
         public static Vector3 ResolveDirection(
             MonsterProjectileStepConfig config,
             Vector3 spawnPosition,
@@ -131,7 +156,11 @@ namespace Game.Entities
             Vector3 fallback = config?.SelfTransform != null
                 ? config.SelfTransform.forward
                 : Vector3.forward;
+            fallback.y = 0f;
+            if (fallback.sqrMagnitude < 0.001f) fallback = Vector3.forward;
+
             Vector3 direction = hasTarget ? targetPosition - spawnPosition : fallback;
+            direction.y = 0f;
             if (direction.sqrMagnitude < 0.001f) direction = fallback;
             return direction.sqrMagnitude > 0f ? direction.normalized : Vector3.forward;
         }
@@ -147,6 +176,136 @@ namespace Game.Entities
                 GetMaxDistance(config)
             );
             return spawnPosition + direction * distance;
+        }
+
+        public static float GetHitRadius(MonsterProjectileStepConfig config)
+        {
+            return config != null ? Mathf.Max(0f, config.HitRadius) : 0f;
+        }
+
+        public static float GetHitHeight(MonsterProjectileStepConfig config)
+        {
+            float radius = GetHitRadius(config);
+            float height = config != null ? Mathf.Max(0f, config.HitHeight) : 0f;
+            return Mathf.Max(height, radius * 2f);
+        }
+
+        public static void GetHitCapsuleAxisPoints(
+            MonsterProjectileStepConfig config,
+            Vector3 projectilePosition,
+            Quaternion projectileRotation,
+            out Vector3 lowerPoint,
+            out Vector3 upperPoint)
+        {
+            GetHitCapsuleAxisPoints(
+                GetHitRadius(config),
+                GetHitHeight(config),
+                projectilePosition,
+                projectileRotation,
+                config?.HitCenterOffset ?? Vector3.zero,
+                out lowerPoint,
+                out upperPoint
+            );
+        }
+
+        public static void GetHitCapsuleAxisPoints(
+            float hitRadius,
+            float hitHeight,
+            Vector3 projectilePosition,
+            Quaternion projectileRotation,
+            Vector3 hitCenterOffset,
+            out Vector3 lowerPoint,
+            out Vector3 upperPoint)
+        {
+            Vector3 hitCenter = projectilePosition + projectileRotation * hitCenterOffset;
+            hitHeight = Mathf.Max(hitHeight, hitRadius * 2f);
+            Vector3 halfAxis = Vector3.up * ((hitHeight - hitRadius * 2f) * 0.5f);
+            lowerPoint = hitCenter - halfAxis;
+            upperPoint = hitCenter + halfAxis;
+        }
+    }
+
+    /// <summary>
+    /// WaterBall 汇聚、抛射与落地的单一计算入口（运行时与 Editor 预演共用）。
+    /// </summary>
+    public static class MonsterWaterBallTiming
+    {
+        public const string FIRE_SMOKE_CHILD_NAME = "FireSmkA";
+        public const string WATER_BALL_CHILD_NAME = "water_ball";
+
+        public static float GetChargeDuration(MonsterWaterBallStepConfig config)
+        {
+            return config != null ? Mathf.Max(0f, config.ChargeDuration) : 0f;
+        }
+
+        public static float GetThrowDuration(MonsterWaterBallStepConfig config)
+        {
+            return config != null ? Mathf.Max(0f, config.ThrowDuration) : 0f;
+        }
+
+        public static float GetLandingTime(MonsterWaterBallStepConfig config)
+        {
+            return GetChargeDuration(config) + GetThrowDuration(config);
+        }
+
+        public static float GetGrowthProgress(MonsterWaterBallStepConfig config, float stepElapsed)
+        {
+            float duration = GetChargeDuration(config);
+            if (duration <= 0f) return 1f;
+
+            return Mathf.Clamp01(Mathf.Max(0f, stepElapsed) / duration);
+        }
+
+        public static float GetGrowthScale(MonsterWaterBallStepConfig config, float stepElapsed)
+        {
+            float progress = GetGrowthProgress(config, stepElapsed);
+            float easedProgress = Mathf.SmoothStep(0f, 1f, progress);
+            float multiplier = config != null ? Mathf.Max(0f, config.FinalScaleMultiplier) : 1f;
+            return easedProgress * multiplier;
+        }
+
+        public static float GetThrowProgress(MonsterWaterBallStepConfig config, float stepElapsed)
+        {
+            float duration = GetThrowDuration(config);
+            if (duration <= 0f) return 1f;
+
+            return Mathf.Clamp01((stepElapsed - GetChargeDuration(config)) / duration);
+        }
+
+        public static Vector3 GetSpawnPosition(MonsterWaterBallStepConfig config, Transform body)
+        {
+            if (body == null) return Vector3.zero;
+
+            Vector3 offset = config != null ? config.SpawnOffset : Vector3.zero;
+            return body.TransformPoint(offset);
+        }
+
+        public static Vector3 ResolveLandingPosition(
+            MonsterWaterBallStepConfig config,
+            Vector3 bodyPosition,
+            Vector3 bodyForward,
+            bool hasTarget,
+            Vector3 targetPosition)
+        {
+            if (hasTarget) return targetPosition;
+
+            Vector3 forward = Vector3.ProjectOnPlane(bodyForward, Vector3.up);
+            if (forward.sqrMagnitude <= 0.0001f) forward = Vector3.forward;
+
+            float distance = config != null ? Mathf.Max(0f, config.FallbackThrowDistance) : 0f;
+            return bodyPosition + forward.normalized * distance;
+        }
+
+        public static Vector3 EvaluateThrowPosition(
+            MonsterWaterBallStepConfig config,
+            Vector3 startPosition,
+            Vector3 landingPosition,
+            float stepElapsed)
+        {
+            float progress = GetThrowProgress(config, stepElapsed);
+            float arcHeight = config != null ? Mathf.Max(0f, config.ArcHeight) : 0f;
+            return Vector3.Lerp(startPosition, landingPosition, progress)
+                   + Vector3.up * (arcHeight * 4f * progress * (1f - progress));
         }
     }
 
@@ -406,6 +565,156 @@ namespace Game.Entities
                 last = Mathf.Max(last, GetRockLandTime(config, i));
             }
             return last;
+        }
+    }
+    /// <summary>
+    /// Charge 的锁定方向、阶段时刻与位移的单一计算入口（运行时与 Editor 预演共用）。
+    /// </summary>
+    public static class MonsterChargeTiming
+    {
+        /// <summary> 蓄力 / 预警结束（冲撞开始）时刻，步骤起点起算 </summary>
+        public static float GetWarningEndTime(MonsterChargeCrashStepConfig config)
+        {
+            return config != null ? Mathf.Max(0f, config.WarningDuration) : 0f;
+        }
+
+        /// <summary> 冲撞进度（0-1；冲撞时长非法时保持 1，供装配校验前预演兜底） </summary>
+        public static float GetChargeProgress(MonsterChargeCrashStepConfig config, float stepElapsed)
+        {
+            if (config == null || config.ChargeDuration <= 0f) return 1f;
+
+            return Mathf.Clamp01((stepElapsed - GetWarningEndTime(config)) / config.ChargeDuration);
+        }
+
+        /// <summary>
+        /// 解析水平锁定方向。目标与起点重合时返回 false，由调用方选择本体朝向等兜底方向。
+        /// </summary>
+        public static bool TryResolvePlanarDirection(Vector3 origin, Vector3 target, out Vector3 direction)
+        {
+            Vector3 toTarget = target - origin;
+            toTarget.y = 0f;
+            if (toTarget.sqrMagnitude <= 0.0001f)
+            {
+                direction = Vector3.forward;
+                return false;
+            }
+
+            direction = toTarget.normalized;
+            return true;
+        }
+
+        /// <summary> 按冲撞进度求固定距离直线位移 </summary>
+        public static Vector3 EvaluatePosition(
+            Vector3 startPosition,
+            Vector3 direction,
+            float distance,
+            float progress)
+        {
+            return startPosition + direction * Mathf.Max(0f, distance) * Mathf.Clamp01(progress);
+        }
+
+        /// <summary>
+        /// 解析撞伤身体胶囊的竖直轴两端球心（总高度 = 轴长度 + 2 × 半径；
+        /// 运行时扫掠判定与 Editor 预演共用，保证判定几何一致）。
+        /// </summary>
+        public static void GetContactCapsuleAxisPoints(
+            MonsterChargeCrashStepConfig config,
+            Vector3 bodyPosition,
+            out Vector3 lowerPoint,
+            out Vector3 upperPoint)
+        {
+            float radius = config != null ? Mathf.Max(0f, config.ContactHitRadius) : 0f;
+            float height = config != null && config.ContactHitHeight > 0f
+                ? config.ContactHitHeight
+                : radius * 2f;
+            height = Mathf.Max(height, radius * 2f);
+
+            float centerHeight = config != null ? config.ContactHitCenterHeight : 0f;
+            Vector3 center = bodyPosition + Vector3.up * centerHeight;
+            Vector3 halfAxis = Vector3.up * ((height - radius * 2f) * 0.5f);
+            lowerPoint = center - halfAxis;
+            upperPoint = center + halfAxis;
+        }
+    }
+
+    /// <summary>
+    /// Entrance 的下落进度与位移单一计算入口（运行时与 Editor 预演共用）。
+    /// </summary>
+    public static class MonsterEntranceTiming
+    {
+        public const float WARNING_SURFACE_HEIGHT_OFFSET = 0.2f;
+
+        /// <summary> 下落进度（0-1；时长非法时保持 1，供装配校验前预演兜底） </summary>
+        public static float GetDescendProgress(
+            MonsterEntranceDescendStepConfig config,
+            float stepElapsed)
+        {
+            if (config == null || config.DescendDuration <= 0f) return 1f;
+
+            return Mathf.Clamp01(Mathf.Max(0f, stepElapsed) / config.DescendDuration);
+        }
+
+        /// <summary> Ease-in 下落进度 </summary>
+        public static float GetEasedDescendProgress(
+            MonsterEntranceDescendStepConfig config,
+            float stepElapsed)
+        {
+            float progress = GetDescendProgress(config, stepElapsed);
+            return progress * progress;
+        }
+
+        /// <summary> 按下落进度求视觉根世界位置（网络根保持最终落点） </summary>
+        public static Vector3 EvaluateDescendPosition(
+            Vector3 originalPosition,
+            MonsterEntranceDescendStepConfig config,
+            float stepElapsed)
+        {
+            if (config == null) return originalPosition;
+
+            float remainHeight =
+                Mathf.Max(0f, config.DescendHeight)
+                * (1f - GetEasedDescendProgress(config, stepElapsed));
+
+            return originalPosition + Vector3.up * remainHeight;
+        }
+
+        /// <summary> 命中地面上方的固定表现抬升（避免 warning 与地面 / 深度面穿插） </summary>
+        public static Vector3 GetWarningSurfacePosition(Vector3 surfacePosition)
+        {
+            return surfacePosition + Vector3.up * WARNING_SURFACE_HEIGHT_OFFSET;
+        }
+
+        /// <summary>
+        /// 落点预警保持水平姿态：只继承网络根 yaw，不继承 pitch / roll，也不对齐地面法线。
+        /// </summary>
+        public static Quaternion GetWarningYawRotation(Transform selfTransform)
+        {
+            return Quaternion.Euler(0f, selfTransform.eulerAngles.y, 0f);
+        }
+
+        /// <summary> 落点预警最终朝向（yaw-only 根朝向 + 配置的特效局部旋转） </summary>
+        public static Quaternion GetWarningRotation(
+            Transform selfTransform,
+            MonsterEffectSettings warningEffect)
+        {
+            return GetWarningYawRotation(selfTransform) * Quaternion.Euler(warningEffect.Rotation);
+        }
+
+        /// <summary> 落点预警局部偏移（按 yaw-only 旋转与根缩放换算到世界空间） </summary>
+        public static Vector3 GetWarningOffset(
+            Transform selfTransform,
+            MonsterEffectSettings warningEffect)
+        {
+            return GetWarningYawRotation(selfTransform)
+                   * Vector3.Scale(selfTransform.lossyScale, warningEffect.Offset);
+        }
+
+        /// <summary> 落点预警等效世界缩放（保留挂父级时的 lossy scale 语义） </summary>
+        public static Vector3 GetWarningScale(
+            Transform selfTransform,
+            MonsterEffectSettings warningEffect)
+        {
+            return Vector3.Scale(selfTransform.lossyScale, warningEffect.Scale);
         }
     }
 }

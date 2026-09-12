@@ -34,8 +34,8 @@ namespace Game.Entities
     /// <summary>
     /// 近战步骤：三段相位 HitDelay 前摇 → Window 伤害窗口 → RecoveryDuration 后摇（时长由相位派生）。
     /// 各端在伤害窗口上升沿按本端时钟原子开窗（伤害覆盖 + 使能检测 + 刷新挥砍基准，防跨禁用期幻影挥砍；
-    /// 动画经 AnimId 状态同步，各端时差 §1.7 偏差允许），下降沿 / 步骤退出关窗。
-    /// 命中经 MeleeHandler 的 OnMeleeHit 事件上报 → 仅结算 SA 在本端的目标（受击方本地结算 §1.7）
+    /// 动画经 AnimId 状态同步，各端时差 偏差允许），下降沿 / 步骤退出关窗。
+    /// 命中经 MeleeHandler 的 OnMeleeHit 事件上报 → 仅结算 SA 在本端的目标（受击方本地结算）
     /// → 组装 DamageData / HitData → 双总线结算。
     /// 伤害以步骤 Config.Damage 为单一可信源（开窗时经 SetDamageOverride 写入）；
     /// 命中过滤以组件 _hitMask 层级为准（层即规则），每目标冷却由组件自身维护（各端独立）。
@@ -71,7 +71,7 @@ namespace Game.Entities
                 return;
             }
 
-            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放（§16.3）；
+            // 进入表现（StepEffects / StepSounds）由基类 Enter 统一播放；
             // 刀刃检测不在步骤起点开启，等各端 Tick 推进到伤害窗口上升沿
         }
 
@@ -138,7 +138,7 @@ namespace Game.Entities
             if (_model is null) return;
             if (_meleeConfig is null) return;
 
-            // 受击方本地结算（§1.7）：只结算 SA 在本端的目标，其余端各自命中各自结算
+            // 受击方本地结算：只结算 SA 在本端的目标，其余端各自命中各自结算
             if (!MonsterSkillDamage.IsTargetAuthoritativeHere(target.Id)) return;
 
             var damageData = new DamageData { Damage = damage, AttackerId = _model.Id, };

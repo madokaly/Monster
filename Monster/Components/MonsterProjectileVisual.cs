@@ -4,13 +4,13 @@ using UnityEngine;
 namespace Game.Components
 {
     /// <summary>
-    /// 怪物弹道视觉组件（网络子实体·简易形态的视觉拼装件）。
-    /// 轮询同实体的 MonsterProjectile 命中事实，各端本地播放命中特效 / 音效。
+    /// 怪物弹道视觉组件（本地简易子实体的视觉拼装件）。
+    /// 轮询同实体的 MonsterProjectile 本端命中事实，播放本地命中特效 / 音效。
     /// </summary>
     public class MonsterProjectileVisual : MonoBehaviour
     {
         [SerializeField]
-        [Tooltip("身份主体（同 GameObject 上的 MonsterProjectile）")]
+        [Tooltip("行为主体（同 GameObject 上的 MonsterProjectile）")]
         private MonsterProjectile _projectile;
 
         [Header("Hit Feedback")]
@@ -67,3 +67,5 @@ namespace Game.Components
         }
     }
 }
+
+
